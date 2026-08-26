@@ -98,7 +98,8 @@ fn sanitize_next(next: Option<&str>) -> String {
             if next.starts_with('/')
                 && !next.starts_with("//")
                 && !next.contains('\\')
-                && !next.contains("://") =>
+                && !next.contains("://")
+                && !next.chars().any(|c| c.is_control()) =>
         {
             next.to_string()
         }
