@@ -45,6 +45,8 @@ pub struct StatsSummary {
     pub project_count: usize,
     pub symbol_count: usize,
     pub total_size: u64,
+    /// What those symbols occupy in the bucket, once compressed.
+    pub stored_size: u64,
     pub upstream_entries: usize,
     pub upstream_size: u64,
     pub last_upload: Option<DateTime<Utc>>,

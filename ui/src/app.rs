@@ -99,6 +99,7 @@ mod tests {
                     project_count: 1,
                     symbol_count: 3,
                     total_size: 1536,
+                    stored_size: 512,
                     upstream_entries: 2,
                     upstream_size: 2048,
                     last_upload: Some(Utc::now()),

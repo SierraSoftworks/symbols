@@ -245,6 +245,9 @@ pub struct ServerStats {
     pub upstream: UpstreamStats,
     pub symbol_count: usize,
     pub total_size: u64,
+    /// What those symbols occupy in the bucket, compressed. Symbols stored
+    /// before the server compressed at rest count at their own size.
+    pub stored_size: u64,
     pub last_upload: Option<DateTime<Utc>>,
 }
 
@@ -255,6 +258,7 @@ pub async fn collect_stats(state: &AppState) -> Result<ServerStats, Error> {
     let mut projects = Vec::new();
     let mut symbol_count = 0;
     let mut total_size = 0;
+    let mut stored_size = 0;
     let mut last_upload: Option<DateTime<Utc>> = None;
 
     for project in state.store.list_projects().await? {
@@ -262,10 +266,12 @@ pub async fn collect_stats(state: &AppState) -> Result<ServerStats, Error> {
         let versions: std::collections::HashSet<&str> =
             symbols.iter().map(|s| s.version.as_str()).collect();
         let size: u64 = symbols.iter().map(|s| s.size).sum();
+        let stored: u64 = symbols.iter().map(|s| s.stored_size.unwrap_or(s.size)).sum();
         let newest = symbols.iter().map(|s| s.uploaded_at).max();
 
         symbol_count += symbols.len();
         total_size += size;
+        stored_size += stored;
         last_upload = last_upload.max(newest);
 
         projects.push(ProjectStats {
@@ -284,6 +290,7 @@ pub async fn collect_stats(state: &AppState) -> Result<ServerStats, Error> {
         upstream,
         symbol_count,
         total_size,
+        stored_size,
         last_upload,
     })
 }

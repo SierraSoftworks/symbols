@@ -21,7 +21,11 @@ pub fn dashboard_view(props: &DashboardProps) -> Html {
             <section class="stats">
                 { stat_tile("Projects", props.stats.project_count.to_string(), None) }
                 { stat_tile("Stored symbols", props.stats.symbol_count.to_string(), None) }
-                { stat_tile("Symbols size", human_bytes(props.stats.total_size), None) }
+                { stat_tile(
+                    "Symbols size",
+                    human_bytes(props.stats.total_size),
+                    Some(format!("{} stored", human_bytes(props.stats.stored_size))),
+                ) }
                 { stat_tile(
                     "Upstream cache",
                     human_bytes(props.stats.upstream_size),

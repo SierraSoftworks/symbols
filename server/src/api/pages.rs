@@ -159,6 +159,7 @@ pub async fn dashboard(
         project_count: stats.projects.len(),
         symbol_count: stats.symbol_count,
         total_size: stats.total_size,
+        stored_size: stats.stored_size,
         upstream_entries: stats.upstream.entries,
         upstream_size: stats.upstream.total_size,
         last_upload: stats.last_upload,

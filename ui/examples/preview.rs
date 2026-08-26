@@ -63,6 +63,7 @@ async fn main() {
                         project_count: 3,
                         symbol_count: 24,
                         total_size: 512 * 1024 * 1024,
+                        stored_size: 119 * 1024 * 1024,
                         upstream_entries: 12,
                         upstream_size: 96 * 1024 * 1024,
                         last_upload: Some(Utc::now() - Duration::hours(3)),
