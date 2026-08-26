@@ -20,8 +20,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use super::{AppState, OidcRuntime, pages};
-use crate::auth::{Identity, LOGIN_COOKIE, SESSION_COOKIE};
+use super::{AppState, pages};
+use crate::auth::{Claims, Identity, LOGIN_COOKIE, SESSION_COOKIE};
 use crate::errors::Error;
 
 const ENDPOINT_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -107,14 +107,6 @@ fn sanitize_next(next: Option<&str>) -> String {
     }
 }
 
-fn oidc_runtime(state: &AppState) -> Result<&OidcRuntime, Error> {
-    state.oidc.as_ref().ok_or_else(|| {
-        Error::BadRequest(
-            "sign-in is not configured on this server (management.oidc)".to_string(),
-        )
-    })
-}
-
 #[derive(Debug, Deserialize)]
 pub struct LoginQuery {
     #[serde(default)]
@@ -126,12 +118,8 @@ pub async fn login(
     state: web::Data<Arc<AppState>>,
     query: web::Query<LoginQuery>,
 ) -> Result<HttpResponse, Error> {
-    let oidc = match oidc_runtime(&state) {
-        Ok(oidc) => oidc,
-        Err(e) => return Ok(pages::error_page(400, &e.to_string()).await),
-    };
-    let oidc_config = state.config.management.oidc.as_ref().expect("checked above");
-    let endpoints = oidc.endpoints.get().await?;
+    let oidc_config = &state.config.management.oidc;
+    let endpoints = state.oidc_endpoints.get().await?;
 
     let csrf_state = random_token();
     let nonce = random_token();
@@ -189,31 +177,12 @@ struct TokenResponse {
     id_token: Option<String>,
 }
 
-/// The id-token claims we act on. Signature/issuer/audience/expiry are
-/// enforced by the validator; the nonce is checked against the login state.
-#[derive(Debug, Deserialize)]
-struct IdTokenClaims {
-    sub: String,
-    #[serde(default)]
-    email: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    preferred_username: Option<String>,
-    #[serde(default)]
-    nonce: Option<String>,
-}
-
 pub async fn callback(
     req: HttpRequest,
     state: web::Data<Arc<AppState>>,
     query: web::Query<CallbackQuery>,
 ) -> Result<HttpResponse, Error> {
-    let oidc = match oidc_runtime(&state) {
-        Ok(oidc) => oidc,
-        Err(e) => return Ok(pages::error_page(400, &e.to_string()).await),
-    };
-    let oidc_config = state.config.management.oidc.as_ref().expect("checked above");
+    let oidc_config = &state.config.management.oidc;
 
     if let Some(error) = &query.error {
         let detail = query.error_description.as_deref().unwrap_or(error);
@@ -244,7 +213,7 @@ pub async fn callback(
 
     let (base, https) = base_url(&req);
     let redirect_uri = format!("{base}/auth/callback");
-    let endpoints = oidc.endpoints.get().await?;
+    let endpoints = state.oidc_endpoints.get().await?;
 
     let token_response: TokenResponse = state
         .http
@@ -271,22 +240,32 @@ pub async fn callback(
         ));
     };
 
-    let claims: IdTokenClaims = oidc.id_tokens.validate(&id_token).await?;
-    if claims.nonce.as_deref() != Some(login_state.nonce.as_str()) {
+    // Signature, issuer, audience (our client id) and expiry are enforced by
+    // the validator; the nonce ties the token to this browser's login.
+    let claims: Claims = state.management_auth.validate(&id_token).await?;
+    if claims.get("nonce").and_then(|n| n.as_str()) != Some(login_state.nonce.as_str()) {
         return Ok(pages::error_page(400, "Sign-in nonce mismatch — please try again.").await);
     }
 
-    let identity = Identity {
-        subject: claims.sub,
-        email: claims.email,
-        name: claims.name.or(claims.preferred_username),
-    };
-    if let Err(e) = identity.check_allowed(&state.config.management.allowed_users) {
-        tracing::warn!(subject = %identity.subject, "Sign-in rejected by allowed_users");
-        return Ok(pages::error_page(403, &e.to_string()).await);
-    }
-
+    // The ACL is deliberately not applied here: it can discriminate on the
+    // request's method and path, and the only path in scope at this point is
+    // /auth/callback. Every management request re-evaluates it against what
+    // is actually being asked for, so a rejected user signs in and then meets
+    // a 403 on the page itself.
+    let identity = Identity::new(claims);
     let session = state.sessions.issue_session(&identity)?;
+    // The session carries the provider's claims so the ACL can be re-checked
+    // on every request. A provider that asserts a great many of them (a long
+    // group list, say) could push the cookie past the ~4KB browsers accept,
+    // at which point it is dropped silently and sign-in appears to do
+    // nothing — so say so rather than leaving it to be puzzled out.
+    if session.len() > 3500 {
+        tracing::warn!(
+            bytes = session.len(),
+            subject = %identity.subject(),
+            "Session cookie is close to the browser size limit; consider narrowing management.oidc.scopes"
+        );
+    }
     let session_cookie = Cookie::build(SESSION_COOKIE, session)
         .path("/")
         .http_only(true)
@@ -300,7 +279,7 @@ pub async fn callback(
     let mut clear_login = Cookie::build(LOGIN_COOKIE, "").path("/auth").finish();
     clear_login.make_removal();
 
-    tracing::info!(subject = %identity.subject, "Management UI sign-in");
+    tracing::info!(subject = %identity.subject(), "Management UI sign-in");
     Ok(HttpResponse::Found()
         .cookie(session_cookie)
         .cookie(clear_login)

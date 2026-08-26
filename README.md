@@ -119,13 +119,35 @@ structure of [grey]'s frontend):
 
 Users sign in through the configured OIDC issuer (authorization code + PKCE,
 exchanged server-side; the session lives in an HttpOnly `SameSite=Lax`
-cookie). Access can optionally be restricted to specific identities with
-`management.allowed_users`.
+cookie).
+
+## Management access
+
+Both the UI and the API authenticate against one OIDC client
+(`management.oidc`): a browser id-token and an API access token are both
+minted for it, so its `client_id` is the audience every management token
+carries.
+
+Who gets in is a [filt-rs] expression — `management.acl` — evaluated on every
+request against the validated token claims (addressed under `claims.`) plus
+the request's `method` and `path`, exactly as [grey]'s admin ACL is:
+
+```yaml
+management:
+  acl: claims.email endswith "@sierrasoftworks.com"
+  # or: method == "GET" || claims.groups contains "symbols-admins"
+```
+
+Because it runs per request rather than once at sign-in, it can distinguish
+reads from writes, and tightening it applies immediately to sessions already
+open. Omitted, it admits anyone the issuer vouches for — the right default
+when the issuer already gates membership (tsidp mints tokens only for tailnet
+members) and this plane is internal-only.
 
 ## Management API
 
-The same surface is scriptable, bearer-authenticated against the configured
-OIDC issuer (internal plane only):
+The same surface is scriptable, bearer-authenticated against the same OIDC
+client (internal plane only):
 
 | Route | Purpose |
 |---|---|
@@ -151,4 +173,5 @@ standard OTLP env vars (`tracing-batteries`).
 
 [debuginfod]: https://sourceware.org/elfutils/Debuginfod.html
 [nomad-pack-registry]: https://github.com/SierraSoftworks/nomad-pack-registry
+[filt-rs]: https://github.com/SierraSoftworks/filters
 [grey]: https://github.com/SierraSoftworks/grey

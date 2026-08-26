@@ -66,23 +66,21 @@ fn default_github_issuer() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagementConfig {
-    /// OIDC issuer whose tokens grant access to the management API (tsidp).
-    /// Also the issuer users sign in against when `oidc` is configured.
-    pub issuer: String,
-    /// The audience expected in bearer tokens presented directly to the
-    /// management API (automation/CLI use).
-    pub audience: String,
-    /// Browser sign-in for the management UI (authorization-code + PKCE,
-    /// exchanged server-side). Without this the UI still renders, but nobody
-    /// can sign in — only bearer-token API access works.
-    #[serde(default)]
-    pub oidc: Option<OidcConfig>,
-    /// Identities (OIDC `sub` or `email`, case-insensitive) allowed to use the
-    /// management plane. Empty means any authenticated user from the issuer —
-    /// appropriate when the issuer itself gates membership (e.g. tsidp only
-    /// mints tokens for tailnet members).
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
+    /// The OIDC client this server authenticates management access against —
+    /// both browser sign-in and bearer tokens presented to the API.
+    pub oidc: OidcConfig,
+    /// A `filt-rs` expression deciding who may use the management plane. It is
+    /// evaluated against the validated token claims (addressed under the
+    /// `claims.` prefix) plus the request's `method` and `path`, e.g.
+    /// `claims.email endswith "@example.com"` or
+    /// `claims.groups contains "symbols-admins" || method == "GET"`.
+    ///
+    /// Defaults to admitting any identity the issuer vouches for, which is
+    /// the right posture when the issuer itself gates membership (tsidp only
+    /// mints tokens for tailnet members) and the management plane is bound to
+    /// an internal address anyway.
+    #[serde(default = "default_management_acl")]
+    pub acl: filt_rs::Filter,
     /// Secret used to sign browser session cookies. Randomised at startup
     /// when unset, which signs everyone out on every deploy — set it to keep
     /// sessions across restarts.
@@ -97,10 +95,20 @@ const fn default_session_duration() -> std::time::Duration {
     std::time::Duration::from_secs(8 * 3600)
 }
 
+/// Admits every authenticated identity; see [`ManagementConfig::acl`].
+fn default_management_acl() -> filt_rs::Filter {
+    filt_rs::Filter::new("true").expect("the allow-all management ACL must parse")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OidcConfig {
-    /// OAuth client registered with the management issuer. The redirect URI to
-    /// register is "{management UI base URL}/auth/callback".
+    /// OIDC issuer whose tokens grant access to the management plane (tsidp),
+    /// and which users sign in against.
+    pub issuer: String,
+    /// OAuth client registered with the issuer. Because every management
+    /// token — a browser id-token or an API access token — is minted for this
+    /// client, the client id is also the audience tokens must carry. The
+    /// redirect URI to register is "{management UI base URL}/auth/callback".
     pub client_id: String,
     /// Client secret; the code exchange happens server-side so this never
     /// reaches a browser.
@@ -203,14 +211,13 @@ impl Config {
                 issuer: default_github_issuer(),
             },
             management: ManagementConfig {
-                issuer: "https://idp.example.com".to_string(),
-                audience: "symbols.example.com".to_string(),
-                oidc: Some(OidcConfig {
+                oidc: OidcConfig {
+                    issuer: "https://idp.example.com".to_string(),
                     client_id: "symbols-ui".to_string(),
                     client_secret: "test-secret".to_string(),
                     scopes: default_oidc_scopes(),
-                }),
-                allowed_users: vec![],
+                },
+                acl: default_management_acl(),
                 session_secret: Some("test-session-secret".to_string()),
                 session_duration: default_session_duration(),
             },
@@ -227,5 +234,33 @@ impl Config {
             .map_err(|e| crate::errors::Error::Config(format!("reading {}: {e}", path.display())))?;
         serde_yaml::from_str(&raw)
             .map_err(|e| crate::errors::Error::Config(format!("parsing {}: {e}", path.display())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The documented configuration surface has to remain the real one.
+    #[test]
+    fn the_example_config_parses() {
+        let config: Config =
+            serde_yaml::from_str(include_str!("../../config.example.yaml")).unwrap();
+        assert_eq!(config.management.oidc.client_id, "symbols");
+        // The ACL is commented out there, so the default applies.
+        assert_eq!(config.management.acl.raw(), "true");
+    }
+
+    /// An ACL that doesn't parse is a startup failure, not a filter that
+    /// quietly matches nothing.
+    #[test]
+    fn a_malformed_acl_is_rejected() {
+        let yaml = include_str!("../../config.example.yaml")
+            .replace("  #acl: claims.email", "  acl: claims.email &&& \"x\"\n  #acl: claims.email");
+        let err = serde_yaml::from_str::<Config>(&yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("management.acl") && err.contains("not a valid operator"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use crate::auth::{Identity, ManagementClaims, SESSION_COOKIE, bearer_token};
+use crate::auth::{Claims, Identity, SESSION_COOKIE, bearer_token};
 use crate::errors::Error;
 use crate::formats::{SymbolFormat, sanitize_id};
 use crate::storage::{SymbolMeta, UpstreamStats, Visibility};
@@ -13,7 +13,7 @@ use crate::storage::{SymbolMeta, UpstreamStats, Visibility};
 /// Authenticates a management-plane request either way it can arrive: a
 /// bearer token from the management issuer (automation), or the browser
 /// session cookie minted by the sign-in flow. Both paths then pass through
-/// the optional `allowed_users` allowlist.
+/// the configured ACL, which sees the same claims either way.
 ///
 /// Note that an *invalid* Authorization header is a hard 401 even if a valid
 /// session cookie is also present — silently falling back would make token
@@ -24,12 +24,8 @@ pub async fn authorize(req: &HttpRequest, state: &AppState) -> Result<Identity, 
         .contains_key(actix_web::http::header::AUTHORIZATION)
     {
         let token = bearer_token(req)?;
-        let claims: ManagementClaims = state.management_auth.validate(&token).await?;
-        Identity {
-            subject: claims.sub,
-            email: claims.email,
-            name: claims.name,
-        }
+        let claims: Claims = state.management_auth.validate(&token).await?;
+        Identity::new(claims)
     } else if let Some(cookie) = req.cookie(SESSION_COOKIE) {
         state.sessions.verify_session(cookie.value())?
     } else {
@@ -38,7 +34,22 @@ pub async fn authorize(req: &HttpRequest, state: &AppState) -> Result<Identity, 
         ));
     };
 
-    identity.check_allowed(&state.config.management.allowed_users)?;
+    // Evaluated per request rather than once at sign-in, so the ACL can key
+    // off what is being asked for (`method`, `path`) and so tightening it
+    // takes effect on sessions that are already open.
+    if let Err(e) = identity.check_acl(
+        &state.config.management.acl,
+        req.method().as_str(),
+        req.path(),
+    ) {
+        tracing::warn!(
+            subject = %identity.subject(),
+            method = %req.method(),
+            path = %req.path(),
+            "Management request rejected by the ACL"
+        );
+        return Err(e);
+    }
     Ok(identity)
 }
 
@@ -94,7 +105,7 @@ pub async fn update_project(
     state.store.put_project(&project).await?;
     tracing::info!(
         project = %project.name,
-        by = %identity.subject,
+        by = %identity.subject(),
         visibility = ?project.visibility,
         keep_versions = ?project.keep_versions,
         "Updated project"
@@ -124,7 +135,7 @@ pub async fn delete_symbol(
     let id = sanitize_id(&path.2)?;
     state.store.get_project(&name).await?.ok_or(Error::NotFound)?;
     state.store.delete_symbol(&name, &id).await?;
-    tracing::info!(project = %name, build_id = %id, by = %identity.subject, "Deleted symbols");
+    tracing::info!(project = %name, build_id = %id, by = %identity.subject(), "Deleted symbols");
     Ok(HttpResponse::NoContent().finish())
 }
 
@@ -192,7 +203,7 @@ pub async fn purge_symbols(
 
     tracing::info!(
         project = %project,
-        by = %identity.subject,
+        by = %identity.subject(),
         filter = ?filter,
         deleted,
         "Purged symbols"
@@ -314,7 +325,7 @@ pub async fn run_sweep(
     let identity = authorize(&req, &state).await?;
     let summary = crate::retention::sweep(&state).await?;
     tracing::info!(
-        by = %identity.subject,
+        by = %identity.subject(),
         symbols_pruned = summary.symbols_pruned,
         upstream_dropped = summary.upstream_dropped,
         "Manual retention sweep"

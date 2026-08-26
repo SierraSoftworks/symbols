@@ -13,6 +13,9 @@ base64 = "0.23"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
+# The management ACL is a filt-rs expression, parsed straight out of the
+# config file (serde) and able to match claims with regexes.
+filt-rs = { version = "1.1", features = ["serde", "regex"] }
 flate2 = "1"
 futures = "0.3"
 hex = "0.4"

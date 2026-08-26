@@ -31,24 +31,25 @@ github:
     - refs/tags/
 
 management:
-  # OIDC issuer whose bearer tokens grant access to the management API, and
-  # which users sign in against when `oidc` is configured below.
-  issuer: https://idp.example.com
-  audience: symbols.sierrasoftworks.com
-  # Browser sign-in for the management UI (authorization code + PKCE,
-  # exchanged server-side). Register the redirect URI
-  # "{management UI base URL}/auth/callback" with the issuer. Omit this block
-  # to run API-only (the UI then has no way to sign in).
+  # The OIDC client this server authenticates management access against —
+  # browser sign-in (authorization code + PKCE, exchanged server-side) and
+  # bearer tokens presented to the API alike. Register the redirect URI
+  # "{management UI base URL}/auth/callback" with the issuer. Every token is
+  # minted for this client, so `client_id` is also the audience tokens must
+  # carry; there is no separate audience to configure.
   oidc:
-    client_id: symbols-ui
+    issuer: https://idp.example.com
+    client_id: symbols
     client_secret: EXAMPLE
     # scopes: [openid, profile, email]
-  # Restrict the management plane to specific identities (`sub` or email).
-  # Empty/omitted admits any authenticated user from the issuer — appropriate
-  # when the issuer itself gates membership (e.g. tsidp only mints tokens for
-  # tailnet members).
-  #allowed_users:
-  #  - benjamin@example.com
+  # Who may use the management plane, as a filt-rs expression over the
+  # validated token claims (under `claims.`) plus the request's `method` and
+  # `path`. Omitted, it admits any identity the issuer vouches for —
+  # appropriate when the issuer itself gates membership (e.g. tsidp only mints
+  # tokens for tailnet members) and this plane is bound internally anyway.
+  #acl: claims.email endswith "@sierrasoftworks.com"
+  # Or, say, let everyone read while reserving changes for a group:
+  #acl: method == "GET" || claims.groups contains "symbols-admins"
   # Signs browser session cookies; set it so sessions survive restarts
   # (randomised per boot when omitted).
   #session_secret: EXAMPLE

@@ -1,16 +1,24 @@
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
+use filt_rs::{Filter, FilterValue, Filterable};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::errors::Error;
+
+/// The claims a validated token carried, kept verbatim (rather than parsed
+/// into a fixed struct) so that the management ACL can match on whatever the
+/// issuer chose to assert — groups, email, custom claims and all.
+pub type Claims = serde_json::Map<String, Value>;
 
 const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Validates JWTs from a single OIDC issuer via its published JWKS. Used both
 /// for GitHub Actions id-tokens (uploads) and for the management-plane OIDC
-/// issuer; keys are cached and refreshed lazily (including once on an unknown
+/// client; keys are cached and refreshed lazily (including once on an unknown
 /// `kid`, so key rotations don't require a restart).
 pub struct Validator {
     http: reqwest::Client,
@@ -143,18 +151,6 @@ pub struct GithubClaims {
     pub git_ref: Option<String>,
 }
 
-/// Management-plane claims: identity only, used for audit logging and the
-/// (optional) allowed-users check.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ManagementClaims {
-    #[serde(default)]
-    pub sub: String,
-    #[serde(default)]
-    pub email: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
 /// Pulls a bearer token out of an Authorization header.
 pub fn bearer_token(req: &actix_web::HttpRequest) -> Result<String, Error> {
     let header = req
@@ -172,37 +168,99 @@ pub fn bearer_token(req: &actix_web::HttpRequest) -> Result<String, Error> {
 
 /// The authenticated management-plane user, whichever way they authenticated
 /// (bearer token from the management issuer, or a browser session cookie
-/// minted by the OIDC sign-in flow).
-#[derive(Debug, Clone)]
+/// minted by the OIDC sign-in flow). Either way the identity is just the
+/// claims the issuer asserted, which is what the ACL is written against.
+#[derive(Debug, Clone, Default)]
 pub struct Identity {
-    pub subject: String,
-    pub email: Option<String>,
-    pub name: Option<String>,
+    pub claims: Claims,
 }
 
 impl Identity {
-    /// Applies the optional allowed-users allowlist ("sub" or email,
-    /// case-insensitive). An empty list admits any authenticated user — the
-    /// issuer itself is the gate then.
-    pub fn check_allowed(&self, allowed_users: &[String]) -> Result<(), Error> {
-        if allowed_users.is_empty() {
-            return Ok(());
+    pub fn new(claims: Claims) -> Self {
+        Self { claims }
+    }
+
+    fn claim(&self, name: &str) -> Option<&str> {
+        self.claims.get(name).and_then(Value::as_str)
+    }
+
+    /// The issuer's stable identifier for the user, used in audit logs.
+    pub fn subject(&self) -> &str {
+        self.claim("sub").unwrap_or("<unknown>")
+    }
+
+    pub fn email(&self) -> Option<&str> {
+        self.claim("email")
+    }
+
+    /// The friendliest name the token offers, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.claim("name").or_else(|| self.claim("preferred_username"))
+    }
+
+    /// Applies the management ACL to this request. A filter that fails to
+    /// evaluate (say it compares a claim the token didn't carry with an
+    /// operator that can't cope) denies the request: an ACL that can't be
+    /// decided is not an ACL that passed.
+    pub fn check_acl(&self, acl: &Filter, method: &str, path: &str) -> Result<(), Error> {
+        let request = AccessRequest {
+            method,
+            path,
+            claims: &self.claims,
+        };
+        match acl.matches(&request) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::Forbidden(format!(
+                "'{}' is not permitted to use this server's management plane",
+                self.subject()
+            ))),
+            Err(e) => {
+                tracing::error!(acl = %acl.raw(), "Management ACL failed to evaluate: {e}");
+                Err(Error::Forbidden(
+                    "this server's management ACL could not be evaluated".to_string(),
+                ))
+            }
         }
-        let allowed = allowed_users.iter().any(|entry| {
-            entry.eq_ignore_ascii_case(&self.subject)
-                || self
-                    .email
-                    .as_deref()
-                    .is_some_and(|email| entry.eq_ignore_ascii_case(email))
-        });
-        if allowed {
-            Ok(())
-        } else {
-            Err(Error::Forbidden(format!(
-                "'{}' is not in this server's allowed_users list",
-                self.subject
-            )))
+    }
+}
+
+/// Exposes a management request to the ACL expression: the HTTP `method` and
+/// `path`, plus every validated token claim under the `claims.` prefix (e.g.
+/// `claims.email`). Unknown keys resolve to null, matching `filt-rs`'s own
+/// convention.
+struct AccessRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    claims: &'a Claims,
+}
+
+impl Filterable for AccessRequest<'_> {
+    fn get(&self, key: &str) -> FilterValue<'_> {
+        match key {
+            "method" => FilterValue::String(Cow::Borrowed(self.method)),
+            "path" => FilterValue::String(Cow::Borrowed(self.path)),
+            key => match key.strip_prefix("claims.") {
+                Some(claim) => self
+                    .claims
+                    .get(claim)
+                    .map(json_to_filter_value)
+                    .unwrap_or(FilterValue::Null),
+                None => FilterValue::Null,
+            },
         }
+    }
+}
+
+fn json_to_filter_value(value: &Value) -> FilterValue<'_> {
+    match value {
+        Value::Null => FilterValue::Null,
+        Value::Bool(b) => FilterValue::Bool(*b),
+        Value::Number(n) => FilterValue::Number(n.as_f64().unwrap_or(0.0)),
+        Value::String(s) => FilterValue::String(Cow::Borrowed(s)),
+        Value::Array(items) => FilterValue::Tuple(items.iter().map(json_to_filter_value).collect()),
+        // Object-valued claims have no scalar filter representation; treat
+        // them as absent.
+        Value::Object(_) => FilterValue::Null,
     }
 }
 
@@ -216,15 +274,16 @@ pub const LOGIN_COOKIE: &str = "symbols_login";
 const SESSION_AUDIENCE: &str = "symbols/session";
 const LOGIN_AUDIENCE: &str = "symbols/login";
 
+/// A browser session. The identity's claims are carried inside (nested, not
+/// flattened, so the provider's own `aud`/`exp` can never shadow ours) rather
+/// than reduced to a subject: the ACL is evaluated on every request, so it
+/// needs the same claims a bearer token would have supplied — and a tightened
+/// ACL then applies to sessions already in flight.
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionClaims {
     aud: String,
     exp: i64,
-    sub: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
+    claims: Claims,
 }
 
 /// The state we need to survive the round-trip to the OIDC provider. Signed
@@ -302,19 +361,13 @@ impl Sessions {
                 + chrono::Duration::from_std(self.session_duration)
                     .unwrap_or_else(|_| chrono::Duration::hours(8)))
             .timestamp(),
-            sub: identity.subject.clone(),
-            email: identity.email.clone(),
-            name: identity.name.clone(),
+            claims: identity.claims.clone(),
         })
     }
 
     pub fn verify_session(&self, token: &str) -> Result<Identity, Error> {
-        let claims: SessionClaims = self.verify(token, SESSION_AUDIENCE)?;
-        Ok(Identity {
-            subject: claims.sub,
-            email: claims.email,
-            name: claims.name,
-        })
+        let session: SessionClaims = self.verify(token, SESSION_AUDIENCE)?;
+        Ok(Identity::new(session.claims))
     }
 
     pub fn session_duration(&self) -> Duration {
@@ -349,11 +402,21 @@ mod tests {
     use super::*;
 
     fn identity() -> Identity {
-        Identity {
-            subject: "user-1".to_string(),
-            email: Some("Benjamin@example.com".to_string()),
-            name: Some("Benjamin".to_string()),
-        }
+        Identity::new(
+            serde_json::json!({
+                "sub": "user-1",
+                "email": "Benjamin@example.com",
+                "name": "Benjamin",
+                "groups": ["symbols-admins", "everyone"],
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+    }
+
+    fn acl(expression: &str) -> Filter {
+        Filter::new(expression).unwrap()
     }
 
     #[test]
@@ -361,8 +424,11 @@ mod tests {
         let sessions = Sessions::new(b"secret", Duration::from_secs(3600));
         let token = sessions.issue_session(&identity()).unwrap();
         let restored = sessions.verify_session(&token).unwrap();
-        assert_eq!(restored.subject, "user-1");
-        assert_eq!(restored.email.as_deref(), Some("Benjamin@example.com"));
+        assert_eq!(restored.subject(), "user-1");
+        assert_eq!(restored.email(), Some("Benjamin@example.com"));
+        // Every claim survives the round-trip, so the ACL sees the same thing
+        // it would have seen on a bearer token.
+        assert_eq!(restored.claims, identity().claims);
     }
 
     #[test]
@@ -387,11 +453,50 @@ mod tests {
     }
 
     #[test]
-    fn allowed_users_matches_sub_and_email() {
+    fn acl_matches_on_claims() {
         let id = identity();
-        assert!(id.check_allowed(&[]).is_ok());
-        assert!(id.check_allowed(&["user-1".to_string()]).is_ok());
-        assert!(id.check_allowed(&["benjamin@example.com".to_string()]).is_ok());
-        assert!(id.check_allowed(&["someone-else".to_string()]).is_err());
+        assert!(id.check_acl(&acl("true"), "GET", "/").is_ok());
+        assert!(id.check_acl(&acl("false"), "GET", "/").is_err());
+        assert!(id.check_acl(&acl(r#"claims.sub == "user-1""#), "GET", "/").is_ok());
+        // Strings compare case-insensitively, as everywhere in filt-rs.
+        assert!(
+            id.check_acl(&acl(r#"claims.email == "benjamin@example.com""#), "GET", "/")
+                .is_ok()
+        );
+        assert!(
+            id.check_acl(&acl(r#"claims.email endswith "@elsewhere.com""#), "GET", "/")
+                .is_err()
+        );
+        // List-valued claims (groups being the useful one) become tuples.
+        assert!(
+            id.check_acl(&acl(r#"claims.groups contains "symbols-admins""#), "GET", "/")
+                .is_ok()
+        );
+        // A claim the token didn't carry is null, which matches nothing.
+        assert!(id.check_acl(&acl(r#"claims.nope == "x""#), "GET", "/").is_err());
+    }
+
+    #[test]
+    fn acl_matches_on_method_and_path() {
+        // A read-only viewer: anything but a GET is denied.
+        let read_only = acl(r#"method == "GET" || claims.groups contains "owners""#);
+        let id = identity();
+        assert!(id.check_acl(&read_only, "GET", "/api/v1/projects").is_ok());
+        assert!(id.check_acl(&read_only, "DELETE", "/api/v1/projects").is_err());
+        assert!(
+            id.check_acl(&acl(r#"path startswith "/api/""#), "GET", "/api/v1/stats")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn acl_denial_is_forbidden_not_unauthenticated() {
+        // The distinction matters to the UI: a 401 bounces the browser into
+        // the sign-in flow, which would loop forever for a signed-in user the
+        // ACL rejects.
+        assert!(matches!(
+            identity().check_acl(&acl("false"), "GET", "/"),
+            Err(Error::Forbidden(_))
+        ));
     }
 }
