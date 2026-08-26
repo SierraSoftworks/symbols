@@ -52,15 +52,15 @@ served only on the internal plane).
 
 ## Serving planes
 
-The server binds two listeners with identical routes but different read
-policies:
+The server binds two listeners with different surfaces:
 
 - **public** — fronted publicly (e.g. `https://symbols.sierrasoftworks.com`):
-  serves only `public` projects' symbols; internal projects are
-  indistinguishable from absent.
-- **internal** — bound to a cluster/tailnet-only address: serves everything.
-  Point Pyroscope's `symbolizer.debuginfod_url` (and your own
-  `DEBUGINFOD_URLS`) here.
+  debuginfod reads of `public` projects' symbols (internal projects are
+  indistinguishable from absent) plus symbol uploads from CI.
+- **internal** — bound to a cluster/tailnet-only address: unrestricted
+  debuginfod reads, the management API, and the management UI. Point
+  Pyroscope's `symbolizer.debuginfod_url` (and your own `DEBUGINFOD_URLS`)
+  here.
 
 Unknown build IDs are federated to an upstream debuginfod server (default:
 `debuginfod.elfutils.org`, covering distro packages such as glibc) and cached
@@ -75,9 +75,32 @@ than through config rollouts. A retention sweep keeps the newest N versions
 per project (default 10, per-project override) and ages out the upstream
 cache, bounding growth.
 
+## Management UI
+
+The internal plane serves a server-rendered management UI (Yew SSR, no client
+bundle — every interaction is a link or a plain HTML form, following the
+structure of [grey]'s frontend):
+
+- **Dashboard** — storage statistics (per project, plus the upstream
+  federation cache), the project registry, and a button to run the retention
+  sweep immediately.
+- **Project pages** — visibility and retention settings, plus every stored
+  release with per-target rows (OS icon, architecture, size, links back to
+  the commit and CI run that produced the upload) and purge actions for a
+  whole release or a single target.
+- **Setup** — copy-pasteable snippets for `DEBUGINFOD_URLS`, gdb, Pyroscope's
+  symbolizer, and the publishing workflow, rendered with this server's real
+  URLs.
+
+Users sign in through the configured OIDC issuer (authorization code + PKCE,
+exchanged server-side; the session lives in an HttpOnly `SameSite=Lax`
+cookie). Access can optionally be restricted to specific identities with
+`management.allowed_users`.
+
 ## Management API
 
-Bearer-authenticated against the configured OIDC issuer:
+The same surface is scriptable, bearer-authenticated against the configured
+OIDC issuer (internal plane only):
 
 | Route | Purpose |
 |---|---|
@@ -86,6 +109,9 @@ Bearer-authenticated against the configured OIDC issuer:
 | `PATCH /api/v1/projects/{org}/{repo}` | Change `visibility` / `keep_versions` |
 | `GET /api/v1/projects/{org}/{repo}/symbols` | List stored symbols |
 | `DELETE /api/v1/projects/{org}/{repo}/symbols/{id}` | Delete one symbol |
+| `DELETE /api/v1/projects/{org}/{repo}/versions/{version}` | Purge a release (`?os=`/`?arch=` to narrow) |
+| `GET /api/v1/stats` | Storage statistics by project + upstream cache |
+| `POST /api/v1/sweep` | Run the retention sweep immediately |
 
 ## Running it
 
@@ -100,3 +126,4 @@ standard OTLP env vars (`tracing-batteries`).
 
 [debuginfod]: https://sourceware.org/elfutils/Debuginfod.html
 [nomad-pack-registry]: https://github.com/SierraSoftworks/nomad-pack-registry
+[grey]: https://github.com/SierraSoftworks/grey

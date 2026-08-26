@@ -26,6 +26,19 @@ inputs:
     description: OIDC audience expected by the symbols server.
     required: false
     default: symbols.sierrasoftworks.com
+  publish:
+    description: >-
+      Whether to publish the extracted symbols to the server. Set to "false"
+      in build jobs that only extract (and strip): the symbol file then
+      travels alongside the binary in a build artifact, and a later job runs
+      this action again (publish left at "true") to upload it — the action
+      detects the pre-extracted file and skips re-extraction. Extraction must
+      happen in the job that ran the build: on macOS the DWARF lives in the
+      build tree's object files (dsymutil reads them), and on Windows the PDB
+      is a sibling file the linker wrote — neither survives into a fresh
+      runner that only downloads the binary.
+    required: false
+    default: "true"
   attach-to-release:
     description: Also attach the symbol file as an asset on the current GitHub release.
     required: false
@@ -60,24 +73,39 @@ runs:
         case "$RUNNER_OS" in
           Linux)
             SYMFILE="${BINARY}.debug"
-            # Keep the DWARF (compressed) and the symbol table in the split
-            # file, link the shipped binary to it, then strip the shipped
-            # binary back down to the size it would have had under cargo's
-            # own strip="debuginfo". Requires the build to have run with
-            # CARGO_PROFILE_RELEASE_STRIP=none (or strip = "none").
-            objcopy --only-keep-debug --compress-debug-sections=zlib "$BINARY" "$SYMFILE"
-            objcopy --add-gnu-debuglink="$SYMFILE" "$BINARY"
-            objcopy --strip-debug "$BINARY"
+            if [ -f "$SYMFILE" ]; then
+              # Pre-extracted by an earlier extract-only run (publish: false)
+              # and carried here in a build artifact; the binary alongside it
+              # is already stripped, so re-splitting would destroy the DWARF.
+              echo "reusing pre-extracted $SYMFILE"
+            else
+              # Keep the DWARF (compressed) and the symbol table in the split
+              # file, link the shipped binary to it, then strip the shipped
+              # binary back down to the size it would have had under cargo's
+              # own strip="debuginfo". Requires the build to have run with
+              # CARGO_PROFILE_RELEASE_STRIP=none (or strip = "none").
+              objcopy --only-keep-debug --compress-debug-sections=zlib "$BINARY" "$SYMFILE"
+              objcopy --add-gnu-debuglink="$SYMFILE" "$BINARY"
+              objcopy --strip-debug "$BINARY"
+            fi
             ;;
           macOS)
-            dsymutil "$BINARY" -o "${BINARY}.dSYM"
             SYMFILE="${BINARY}.dSYM/Contents/Resources/DWARF/$(basename "$BINARY")"
-            strip -S "$BINARY"
+            if [ -f "$SYMFILE" ]; then
+              echo "reusing pre-extracted $SYMFILE"
+            else
+              # dsymutil collects DWARF from the build tree's object files, so
+              # this branch only produces real debug info in the job that ran
+              # the build — extract there (publish: false) when publishing
+              # happens in a separate job.
+              dsymutil "$BINARY" -o "${BINARY}.dSYM"
+              strip -S "$BINARY"
+            fi
             ;;
           Windows)
             SYMFILE="${BINARY%.exe}.pdb"
             if [ ! -f "$SYMFILE" ]; then
-              echo "::error::expected PDB '$SYMFILE' next to the binary (is debug info enabled?)" >&2
+              echo "::error::expected PDB '$SYMFILE' next to the binary (is debug info enabled, and did the build artifact include the PDB?)" >&2
               exit 1
             fi
             ;;
@@ -92,6 +120,7 @@ runs:
 
     - name: Publish to the symbols server
       id: publish
+      if: inputs.publish == 'true'
       shell: bash
       run: |
         set -euo pipefail
@@ -103,8 +132,33 @@ runs:
         TOKEN="$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.audience }}" | jq -r .value)"
 
+        uri() { jq -rn --arg v "$1" '$v|@uri'; }
+
+        # Target/build metadata, shown alongside the symbols in the server's
+        # management UI. The server derives format and (where the file carries
+        # one) architecture from the file itself; these tags fill in the rest
+        # and link the upload back to this workflow run.
+        case "$RUNNER_OS" in
+          Linux) OS=linux ;;
+          macOS) OS=macos ;;
+          Windows) OS=windows ;;
+          *) OS="" ;;
+        esac
+        case "${RUNNER_ARCH:-}" in
+          X64) ARCH=amd64 ;;
+          ARM64) ARCH=arm64 ;;
+          X86) ARCH=i386 ;;
+          ARM) ARCH=arm ;;
+          *) ARCH="" ;;
+        esac
+        BUILD_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+        QUERY="version=$(uri "${{ inputs.version }}")"
+        QUERY="$QUERY&os=$OS&arch=$ARCH&commit=$GITHUB_SHA"
+        QUERY="$QUERY&build_url=$(uri "$BUILD_URL")"
+
         RESPONSE="$(curl -sSf -X POST \
-          "${{ inputs.server }}/api/v1/symbols?version=${{ inputs.version }}" \
+          "${{ inputs.server }}/api/v1/symbols?$QUERY" \
           -H "Authorization: Bearer $TOKEN" \
           -H "Content-Type: application/octet-stream" \
           --data-binary "@${{ steps.extract.outputs.symbol-file }}")"
@@ -113,7 +167,7 @@ runs:
         echo "build-id=$(echo "$RESPONSE" | jq -r '.build_id')" >> "$GITHUB_OUTPUT"
 
     - name: Attach symbols to the GitHub release
-      if: inputs.attach-to-release == 'true' && github.event_name == 'release'
+      if: inputs.publish == 'true' && inputs.attach-to-release == 'true' && github.event_name == 'release'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}

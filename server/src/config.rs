@@ -18,14 +18,19 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    /// The public plane: debuginfod reads of public projects, symbol uploads,
-    /// and the (OIDC-authenticated) management API. Fronted by the edge
-    /// load balancer as https://symbols.sierrasoftworks.com.
+    /// The public plane: debuginfod reads of public projects and symbol
+    /// uploads. Fronted by the edge load balancer as
+    /// https://symbols.sierrasoftworks.com.
     pub public_addr: String,
-    /// The internal plane: identical routes, but debuginfod reads are
-    /// unrestricted. Only ever bound to an address reachable from inside the
+    /// The internal plane: everything the public plane serves plus
+    /// unrestricted debuginfod reads, the management API, and the management
+    /// UI. Only ever bound to an address reachable from inside the
     /// tailnet/cluster (Pyroscope's symbolizer and developer tooling).
     pub internal_addr: String,
+    /// The public plane's externally reachable base URL, shown in the setup
+    /// page's snippets. Defaults to "https://{github.audience}".
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,9 +67,51 @@ fn default_github_issuer() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ManagementConfig {
     /// OIDC issuer whose tokens grant access to the management API (tsidp).
+    /// Also the issuer users sign in against when `oidc` is configured.
     pub issuer: String,
-    /// The audience expected in management tokens.
+    /// The audience expected in bearer tokens presented directly to the
+    /// management API (automation/CLI use).
     pub audience: String,
+    /// Browser sign-in for the management UI (authorization-code + PKCE,
+    /// exchanged server-side). Without this the UI still renders, but nobody
+    /// can sign in — only bearer-token API access works.
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
+    /// Identities (OIDC `sub` or `email`, case-insensitive) allowed to use the
+    /// management plane. Empty means any authenticated user from the issuer —
+    /// appropriate when the issuer itself gates membership (e.g. tsidp only
+    /// mints tokens for tailnet members).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Secret used to sign browser session cookies. Randomised at startup
+    /// when unset, which signs everyone out on every deploy — set it to keep
+    /// sessions across restarts.
+    #[serde(default)]
+    pub session_secret: Option<String>,
+    /// How long a browser session lasts before the user must sign in again.
+    #[serde(with = "humantime_serde", default = "default_session_duration")]
+    pub session_duration: std::time::Duration,
+}
+
+const fn default_session_duration() -> std::time::Duration {
+    std::time::Duration::from_secs(8 * 3600)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcConfig {
+    /// OAuth client registered with the management issuer. The redirect URI to
+    /// register is "{management UI base URL}/auth/callback".
+    pub client_id: String,
+    /// Client secret; the code exchange happens server-side so this never
+    /// reaches a browser.
+    pub client_secret: String,
+    /// Scopes requested at sign-in.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".to_string(), "profile".to_string(), "email".to_string()]
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +187,7 @@ impl Config {
             server: ServerConfig {
                 public_addr: "127.0.0.1:0".to_string(),
                 internal_addr: "127.0.0.1:0".to_string(),
+                public_url: Some("https://symbols.example.com".to_string()),
             },
             storage: StorageConfig {
                 endpoint: "http://localhost:1".to_string(),
@@ -157,6 +205,14 @@ impl Config {
             management: ManagementConfig {
                 issuer: "https://idp.example.com".to_string(),
                 audience: "symbols.example.com".to_string(),
+                oidc: Some(OidcConfig {
+                    client_id: "symbols-ui".to_string(),
+                    client_secret: "test-secret".to_string(),
+                    scopes: default_oidc_scopes(),
+                }),
+                allowed_users: vec![],
+                session_secret: Some("test-session-secret".to_string()),
+                session_duration: default_session_duration(),
             },
             federation: FederationConfig {
                 upstream: None,

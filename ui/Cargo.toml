@@ -1,0 +1,17 @@
+[package]
+name = "symbols-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Server-side-rendered Yew frontend for the symbols server's management plane."
+
+# Pure SSR: this crate is only ever compiled natively, into the server binary.
+# There is deliberately no WASM/hydration build (and so no Trunk pipeline) —
+# every interaction the management UI needs is a link or a plain HTML form.
+[dependencies]
+chrono = "0.4"
+yew = { version = "0.23", features = ["ssr"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
