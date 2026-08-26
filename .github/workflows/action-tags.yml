@@ -1,0 +1,49 @@
+name: Action Tags
+
+# The composite action in action.yml is consumed as
+# `SierraSoftworks/symbols@vN`, so every published release needs to move the
+# floating major version tag onto the release's commit. Mirrors the approach
+# used by SierraSoftworks/gh-releases (minus the dist build, since a composite
+# action ships no compiled output).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  major-tag:
+    name: Update Major Version Tag
+    runs-on: ubuntu-latest
+
+    # Pre-releases must not move the floating tag out from under consumers.
+    if: "!github.event.release.prerelease"
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Update the major version tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          MAJOR="$(echo "${TAG}" | sed -n 's/^\(v[0-9]\+\)\..*/\1/p')"
+          if [ -z "${MAJOR}" ]; then
+            echo "::notice::'${TAG}' is not a vN.N.N tag, skipping major tag update"
+            exit 0
+          fi
+
+          # Uses the format ${user.id}+${user.login}@users.noreply.github.com
+          # from https://api.github.com/users/github-actions%5Bbot%5D
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -fa "${MAJOR}" -m "${MAJOR}"
+          git push --force origin "${MAJOR}"
+
+          echo "::notice::Moved ${MAJOR} to ${TAG}"
