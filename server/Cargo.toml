@@ -17,7 +17,7 @@ hex = "0.4"
 humantime-serde = "1.1"
 # rust_crypto selects the process-level crypto provider; without exactly one
 # provider feature, signing/validation panics at runtime.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 object = { version = "0.40", default-features = false, features = ["read"] }
 object_store = { version = "0.11", features = ["aws"] }
 pdb = "0.8"
