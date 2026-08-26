@@ -41,26 +41,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
-    let state = Arc::new(AppState {
-        github_auth: auth::Validator::new(
-            http.clone(),
-            &config.github.issuer,
-            &config.github.audience,
-        ),
-        management_auth: auth::Validator::new(
-            http.clone(),
-            &config.management.issuer,
-            &config.management.audience,
-        ),
-        store,
-        http,
-        config,
-    });
+    if config.management.oidc.is_some() && config.management.session_secret.is_none() {
+        tracing::warn!(
+            "No management.session_secret configured; browser sessions will not survive restarts"
+        );
+    }
+
+    let state = Arc::new(AppState::new(config, store, http));
 
     tracing::info!(
         public = %state.config.server.public_addr,
         internal = %state.config.server.internal_addr,
         trusted_orgs = ?state.config.github.trusted_orgs,
+        ui_sign_in = state.oidc.is_some(),
         "Starting symbols server"
     );
 
@@ -72,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .app_data(web::Data::new(public_state.clone()))
             .app_data(web::Data::new(Plane::Public))
             .app_data(web::PayloadConfig::new(MAX_UPLOAD_BYTES))
-            .configure(api::configure)
+            .configure(api::configure_public)
     })
     .bind(&state.config.server.public_addr)?
     .run();
@@ -83,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .app_data(web::Data::new(internal_state.clone()))
             .app_data(web::Data::new(Plane::Internal))
             .app_data(web::PayloadConfig::new(MAX_UPLOAD_BYTES))
-            .configure(api::configure)
+            .configure(api::configure_internal)
     })
     .bind(&state.config.server.internal_addr)?
     .run();

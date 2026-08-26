@@ -18,8 +18,17 @@ pub async fn run(state: Arc<AppState>) {
     }
 }
 
-pub async fn sweep(state: &AppState) -> Result<(), Error> {
+/// What a sweep did — surfaced in the management API/UI when a sweep is run
+/// manually.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct SweepSummary {
+    pub symbols_pruned: usize,
+    pub upstream_dropped: usize,
+}
+
+pub async fn sweep(state: &AppState) -> Result<SweepSummary, Error> {
     let default_keep = state.config.retention.default_keep_versions.max(1);
+    let mut summary = SweepSummary::default();
 
     for project in state.store.list_projects().await? {
         let keep = project.keep_versions.unwrap_or(default_keep).max(1);
@@ -32,18 +41,19 @@ pub async fn sweep(state: &AppState) -> Result<(), Error> {
                 "Pruning symbols past the retention window"
             );
             state.store.delete_symbol(&project.name, &stale.id).await?;
+            summary.symbols_pruned += 1;
         }
     }
 
     let cutoff = chrono::Utc::now()
         - chrono::Duration::from_std(state.config.retention.upstream_cache_max_age)
             .unwrap_or_else(|_| chrono::Duration::days(90));
-    let dropped = state.store.prune_upstream(cutoff).await?;
-    if dropped > 0 {
-        tracing::info!(dropped, "Pruned upstream federation cache");
+    summary.upstream_dropped = state.store.prune_upstream(cutoff).await?;
+    if summary.upstream_dropped > 0 {
+        tracing::info!(dropped = summary.upstream_dropped, "Pruned upstream federation cache");
     }
 
-    Ok(())
+    Ok(summary)
 }
 
 /// Groups symbols by version tag and returns those belonging to versions
@@ -83,6 +93,9 @@ mod tests {
             size: 1,
             uploaded_at: Utc::now() - Duration::days(age_days),
             uploaded_from: None,
+            os: None,
+            commit: None,
+            build_url: None,
         }
     }
 

@@ -49,6 +49,18 @@ pub struct SymbolMeta {
     /// The `ref` claim of the uploading workflow, for audit purposes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded_from: Option<String>,
+    /// Uploader-supplied OS tag ("linux", "macos", "windows"); when absent
+    /// the UI infers it from the symbol format. All the fields below are
+    /// additive with defaults, so meta.json written before they existed still
+    /// deserialises.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    /// Commit SHA the symbols were built from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Link to the CI run that produced the upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_url: Option<String>,
 }
 
 /// The global build-id index entry: resolves an id to the project holding it
@@ -56,6 +68,12 @@ pub struct SymbolMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub project: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct UpstreamStats {
+    pub entries: usize,
+    pub total_size: u64,
 }
 
 #[derive(Clone)]
@@ -249,6 +267,17 @@ impl Store {
         Ok(())
     }
 
+    /// Sums the upstream federation cache for the stats surfaces.
+    pub async fn upstream_stats(&self) -> Result<UpstreamStats, Error> {
+        let mut entries = self.inner.list(Some(&Path::from("_upstream")));
+        let mut stats = UpstreamStats::default();
+        while let Some(meta) = entries.try_next().await? {
+            stats.entries += 1;
+            stats.total_size += meta.size as u64;
+        }
+        Ok(stats)
+    }
+
     /// Drops upstream cache entries older than the cutoff; returns the number dropped.
     pub async fn prune_upstream(&self, cutoff: DateTime<Utc>) -> Result<usize, Error> {
         let mut dropped = 0;
@@ -292,6 +321,9 @@ mod tests {
             size: 4,
             uploaded_at: Utc::now(),
             uploaded_from: Some("refs/tags/v1.0.0".to_string()),
+            os: Some("linux".to_string()),
+            commit: None,
+            build_url: None,
         }
     }
 

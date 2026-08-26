@@ -15,6 +15,70 @@ pub struct UploadQuery {
     /// retention. Optional but strongly recommended.
     #[serde(default)]
     pub version: String,
+    /// OS tag ("linux", "macos", "windows"), normally the runner's OS.
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Architecture tag; only used when the symbol file itself doesn't carry
+    /// one (PDBs), since the file is the authority on what it contains.
+    #[serde(default)]
+    pub arch: Option<String>,
+    /// Commit SHA the symbols were built from.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// Link to the CI run that produced the upload.
+    #[serde(default)]
+    pub build_url: Option<String>,
+}
+
+/// Uploader-supplied metadata ends up rendered in the management UI (labels
+/// and hrefs), so each field is held to a tight shape rather than stored
+/// verbatim. Empty values are treated as absent first (the publish action
+/// sends `os=`/`arch=` with empty values when it can't classify the runner).
+fn normalize_metadata(query: &mut UploadQuery) {
+    for field in [
+        &mut query.os,
+        &mut query.arch,
+        &mut query.commit,
+        &mut query.build_url,
+    ] {
+        if field.as_deref().is_some_and(|v| v.is_empty()) {
+            *field = None;
+        }
+    }
+}
+
+fn validate_metadata(query: &UploadQuery) -> Result<(), Error> {
+    for (name, value, max) in [
+        ("version", Some(&query.version), 128usize),
+        ("os", query.os.as_ref(), 32),
+        ("arch", query.arch.as_ref(), 32),
+    ] {
+        if let Some(value) = value {
+            let ok = value.len() <= max
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+' | '/'));
+            if !ok {
+                return Err(Error::BadRequest(format!("invalid {name} tag")));
+            }
+        }
+    }
+
+    if let Some(commit) = &query.commit {
+        if commit.len() > 64 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::BadRequest("invalid commit sha".to_string()));
+        }
+    }
+
+    if let Some(build_url) = &query.build_url {
+        let parsed = url::Url::parse(build_url)
+            .map_err(|e| Error::BadRequest(format!("invalid build_url: {e}")))?;
+        if build_url.len() > 512 || !matches!(parsed.scheme(), "http" | "https") {
+            return Err(Error::BadRequest("invalid build_url".to_string()));
+        }
+    }
+
+    Ok(())
 }
 
 /// `POST /api/v1/symbols` — authenticated by a GitHub Actions OIDC id-token.
@@ -59,6 +123,10 @@ pub async fn upload_symbol(
         }
     }
 
+    let mut query = query.into_inner();
+    normalize_metadata(&mut query);
+    validate_metadata(&query)?;
+
     if body.is_empty() {
         return Err(Error::BadRequest("empty upload".to_string()));
     }
@@ -95,11 +163,16 @@ pub async fn upload_symbol(
     let meta = SymbolMeta {
         id: info.id.clone(),
         format: info.format,
-        arch: info.arch.clone(),
+        // The file's own architecture wins; the uploader's tag only fills the
+        // gap for formats that don't declare one (PDBs).
+        arch: info.arch.clone().or_else(|| query.arch.clone()),
         version: query.version.clone(),
         size: body.len() as u64,
         uploaded_at: chrono::Utc::now(),
         uploaded_from: claims.git_ref.clone(),
+        os: query.os.as_deref().map(|os| os.to_ascii_lowercase()),
+        commit: query.commit.as_deref().map(|c| c.to_ascii_lowercase()),
+        build_url: query.build_url.clone(),
     };
 
     let size = body.len();

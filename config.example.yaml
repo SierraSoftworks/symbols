@@ -2,11 +2,15 @@
 # rendered by the Nomad pack's template (see SierraSoftworks/nomad-pack-registry,
 # packs/symbols) with secrets injected from Nomad variables.
 server:
-  # Public plane: debuginfod reads of public projects, uploads, management API.
+  # Public plane: debuginfod reads of public projects and symbol uploads.
   public_addr: 0.0.0.0:8080
-  # Internal plane: identical routes, but reads are unrestricted. Only ever
-  # bind this to an address that is not reachable from the public internet.
+  # Internal plane: everything above plus unrestricted reads, the management
+  # API, and the management UI. Only ever bind this to an address that is not
+  # reachable from the public internet.
   internal_addr: 127.0.0.1:8081
+  # The public plane's externally reachable base URL, used in the setup page's
+  # snippets. Defaults to "https://{github.audience}".
+  #public_url: https://symbols.sierrasoftworks.com
 
 storage:
   endpoint: http://127.0.0.1:3900
@@ -27,9 +31,29 @@ github:
     - refs/tags/
 
 management:
-  # OIDC issuer whose bearer tokens grant access to the management API.
+  # OIDC issuer whose bearer tokens grant access to the management API, and
+  # which users sign in against when `oidc` is configured below.
   issuer: https://idp.example.com
   audience: symbols.sierrasoftworks.com
+  # Browser sign-in for the management UI (authorization code + PKCE,
+  # exchanged server-side). Register the redirect URI
+  # "{management UI base URL}/auth/callback" with the issuer. Omit this block
+  # to run API-only (the UI then has no way to sign in).
+  oidc:
+    client_id: symbols-ui
+    client_secret: EXAMPLE
+    # scopes: [openid, profile, email]
+  # Restrict the management plane to specific identities (`sub` or email).
+  # Empty/omitted admits any authenticated user from the issuer — appropriate
+  # when the issuer itself gates membership (e.g. tsidp only mints tokens for
+  # tailnet members).
+  #allowed_users:
+  #  - benjamin@example.com
+  # Signs browser session cookies; set it so sessions survive restarts
+  # (randomised per boot when omitted).
+  #session_secret: EXAMPLE
+  # How long a browser session lasts before re-authentication.
+  #session_duration: 8h
 
 federation:
   # Unknown build IDs are looked up here (distro symbols: glibc, openssl, ...)

@@ -130,15 +130,13 @@ mod tests {
 
     use actix_web::{App, test, web};
 
-    use crate::api::{AppState, Plane, configure};
-    use crate::auth::Validator;
+    use crate::api::{AppState, Plane, configure_internal, configure_public};
     use crate::config::Config;
     use crate::formats::{SymbolFormat, SymbolInfo};
     use crate::storage::{Project, Store, SymbolMeta, Visibility};
 
     async fn seeded_state() -> Arc<AppState> {
         let config = Config::test();
-        let http = reqwest::Client::new();
         let store = Store::in_memory();
 
         for (name, visibility) in [
@@ -174,6 +172,9 @@ mod tests {
                 size: data.len() as u64,
                 uploaded_at: chrono::Utc::now(),
                 uploaded_from: None,
+                os: None,
+                commit: None,
+                build_url: None,
             };
             store
                 .put_symbol(project, &info, &meta, bytes::Bytes::from_static(data))
@@ -181,20 +182,14 @@ mod tests {
                 .unwrap();
         }
 
-        Arc::new(AppState {
-            github_auth: Validator::new(http.clone(), &config.github.issuer, &config.github.audience),
-            management_auth: Validator::new(
-                http.clone(),
-                &config.management.issuer,
-                &config.management.audience,
-            ),
-            store,
-            http,
-            config,
-        })
+        Arc::new(AppState::new(config, store, reqwest::Client::new()))
     }
 
     async fn get(state: &Arc<AppState>, plane: Plane, path: &str) -> (u16, Vec<u8>) {
+        let configure = match plane {
+            Plane::Public => configure_public,
+            Plane::Internal => configure_internal,
+        };
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(state.clone()))
@@ -246,5 +241,96 @@ mod tests {
         assert_eq!(status, 404);
         let (status, _) = get(&state, Plane::Internal, "/buildid/aabbccdd/executable").await;
         assert_eq!(status, 404);
+    }
+
+    #[actix_web::test]
+    async fn management_surfaces_do_not_exist_on_the_public_plane() {
+        let state = seeded_state().await;
+        // The management API, the UI, and the sign-in flow are internal-plane
+        // only; the public listener must not even route them.
+        for path in ["/api/v1/projects", "/", "/setup", "/auth/login", "/static/styles.css"] {
+            let (status, _) = get(&state, Plane::Public, path).await;
+            assert_eq!(status, 404, "{path} should not be routed publicly");
+        }
+    }
+
+    #[actix_web::test]
+    async fn ui_pages_redirect_unauthenticated_browsers_to_sign_in() {
+        let state = seeded_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state.clone()))
+                .app_data(web::Data::new(Plane::Internal))
+                .configure(configure_internal),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get().uri("/projects/SierraSoftworks/grey").to_request(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 302);
+        let location = response
+            .headers()
+            .get(actix_web::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            location.starts_with("/auth/login?next=%2Fprojects%2FSierraSoftworks%2Fgrey"),
+            "unexpected redirect target: {location}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn session_cookie_grants_access_to_ui_and_api() {
+        let state = seeded_state().await;
+        let session = state
+            .sessions
+            .issue_session(&crate::auth::Identity {
+                subject: "user-1".to_string(),
+                email: Some("benjamin@example.com".to_string()),
+                name: Some("Benjamin".to_string()),
+            })
+            .unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state.clone()))
+                .app_data(web::Data::new(Plane::Internal))
+                .configure(configure_internal),
+        )
+        .await;
+
+        for uri in ["/", "/projects/SierraSoftworks/grey", "/api/v1/projects", "/api/v1/stats"] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(uri)
+                    .cookie(actix_web::cookie::Cookie::new(
+                        crate::auth::SESSION_COOKIE,
+                        session.clone(),
+                    ))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), 200, "{uri} should be accessible");
+        }
+
+        // And the rendered dashboard should carry the signed-in user.
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/")
+                .cookie(actix_web::cookie::Cookie::new(
+                    crate::auth::SESSION_COOKIE,
+                    session.clone(),
+                ))
+                .to_request(),
+        )
+        .await;
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(body.contains("Benjamin"));
+        assert!(body.contains("SierraSoftworks/grey"));
     }
 }

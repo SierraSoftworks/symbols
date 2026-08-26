@@ -1,0 +1,576 @@
+/* Management UI stylesheet. Hand-written CSS (no Sass pipeline — the UI is
+ * SSR-only, so there is no Trunk build to compile it). Theming follows grey's
+ * approach: custom properties on :root with a prefers-color-scheme override,
+ * BEM-ish class names, no framework. */
+
+:root {
+  --color-bg: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-border: #dcdfe4;
+  --color-text: #1f2429;
+  --color-text-muted: #6b7280;
+  --color-accent: #6d4aff;
+  --color-accent-text: #ffffff;
+  --color-ok-bg: #e5f6ec;
+  --color-ok-text: #14683a;
+  --color-warn-bg: #fdf3d8;
+  --color-warn-text: #7a5b0b;
+  --color-danger: #c0392b;
+  --color-danger-text: #ffffff;
+  --color-code-bg: #23262d;
+  --color-code-text: #e6e8ee;
+  --radius: 8px;
+  --shadow: 0 1px 2px rgba(16, 20, 28, 0.06), 0 1px 6px rgba(16, 20, 28, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #14161a;
+    --color-surface: #1d2026;
+    --color-border: #31353d;
+    --color-text: #e8eaee;
+    --color-text-muted: #9aa1ac;
+    --color-accent: #8b6dff;
+    --color-ok-bg: #12331f;
+    --color-ok-text: #7fd8a2;
+    --color-warn-bg: #3a2f10;
+    --color-warn-text: #e8c56a;
+    --color-code-bg: #101216;
+    --color-code-text: #dfe2e9;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code {
+  font-family: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
+  font-size: 0.9em;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+/* --- Header ------------------------------------------------------------- */
+
+.header {
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.header__inner {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 1.25rem;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  height: 3.5rem;
+}
+
+.header__brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  color: var(--color-text);
+  font-weight: 700;
+}
+
+.header__brand:hover {
+  text-decoration: none;
+}
+
+.header__brand-mark {
+  color: var(--color-accent);
+  font-family: ui-monospace, monospace;
+}
+
+.header__nav {
+  display: flex;
+  gap: 0.25rem;
+  flex: 1;
+}
+
+.header__nav-link {
+  padding: 0.35rem 0.75rem;
+  border-radius: var(--radius);
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
+.header__nav-link:hover {
+  color: var(--color-text);
+  text-decoration: none;
+  background: var(--color-bg);
+}
+
+.header__nav-link--active {
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+.header__session {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.header__user {
+  color: var(--color-text-muted);
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header__auth-link {
+  font-weight: 500;
+}
+
+/* --- Page structure ----------------------------------------------------- */
+
+.page {
+  flex: 1;
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 3rem;
+}
+
+.content {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.content--narrow {
+  max-width: 32rem;
+  margin: 3rem auto 0;
+}
+
+.page-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.page-head__title {
+  margin: 0;
+  font-size: 1.5rem;
+}
+
+.page-head__meta {
+  color: var(--color-text-muted);
+}
+
+.footer {
+  padding: 1rem 1.25rem 1.5rem;
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+}
+
+.footer p {
+  margin: 0;
+}
+
+/* --- Cards & stats ------------------------------------------------------ */
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 1.1rem 1.25rem;
+}
+
+.card__title {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+}
+
+.card p {
+  margin: 0 0 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.75rem;
+}
+
+.stat {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 0.85rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.stat__label {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+.stat__value {
+  font-size: 1.35rem;
+  font-weight: 700;
+}
+
+.stat__detail {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
+
+.empty {
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+/* --- Tables ------------------------------------------------------------- */
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.table th {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table__num {
+  text-align: right;
+}
+
+td.table__num {
+  font-variant-numeric: tabular-nums;
+}
+
+.table__link {
+  font-weight: 500;
+}
+
+/* --- Badges & chips ----------------------------------------------------- */
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.badge--public {
+  background: var(--color-ok-bg);
+  color: var(--color-ok-text);
+}
+
+.badge--internal {
+  background: var(--color-warn-bg);
+  color: var(--color-warn-text);
+}
+
+.chip {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 4px;
+  border: 1px solid var(--color-border);
+  font-size: 0.78rem;
+  font-family: ui-monospace, monospace;
+}
+
+.chip--muted {
+  color: var(--color-text-muted);
+}
+
+.os-icon {
+  display: inline-flex;
+  vertical-align: middle;
+  color: var(--color-text);
+}
+
+.os-icon .icon {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+
+.target {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.build-id {
+  color: var(--color-text-muted);
+}
+
+.source-links {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.source-links__item {
+  font-size: 0.85rem;
+}
+
+/* --- Releases ----------------------------------------------------------- */
+
+.release {
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.release:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.release__head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+
+.release__version {
+  margin: 0;
+  font-size: 1rem;
+  font-family: ui-monospace, monospace;
+}
+
+.release__meta {
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+  flex: 1;
+}
+
+/* --- Forms & buttons ---------------------------------------------------- */
+
+.form--row {
+  display: flex;
+  align-items: flex-end;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.form__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.form__label {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+.form__hint {
+  margin: 0.75rem 0 0;
+  font-size: 0.85rem;
+}
+
+select,
+input[type="number"],
+input[type="text"] {
+  background: var(--color-bg);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.6rem;
+  font: inherit;
+  min-width: 10rem;
+}
+
+.button {
+  display: inline-block;
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+  border: none;
+  border-radius: var(--radius);
+  padding: 0.45rem 0.9rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.button:hover {
+  filter: brightness(1.08);
+  text-decoration: none;
+}
+
+.button--danger {
+  background: var(--color-danger);
+  color: var(--color-danger-text);
+}
+
+.button--small {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+/* --- Flash notices ------------------------------------------------------ */
+
+.flash {
+  border-radius: var(--radius);
+  padding: 0.6rem 1rem;
+  font-weight: 500;
+}
+
+.flash--ok {
+  background: var(--color-ok-bg);
+  color: var(--color-ok-text);
+}
+
+.flash--error {
+  background: var(--color-warn-bg);
+  color: var(--color-warn-text);
+}
+
+/* --- Snippets ----------------------------------------------------------- */
+
+.snippet {
+  margin: 0.5rem 0 1rem;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+}
+
+.snippet:last-child {
+  margin-bottom: 0;
+}
+
+.snippet__bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--color-code-bg);
+  color: var(--color-code-text);
+  padding: 0.3rem 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.snippet__lang {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  opacity: 0.7;
+}
+
+.snippet__copy {
+  background: transparent;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 4px;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.snippet__copy.copied {
+  border-color: transparent;
+  background: var(--color-ok-text);
+  color: var(--color-code-bg);
+}
+
+.snippet__code {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  background: var(--color-code-bg);
+  color: var(--color-code-text);
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+/* --- Error page --------------------------------------------------------- */
+
+.error-card {
+  text-align: center;
+}
+
+.error-card__status {
+  margin: 0;
+  font-size: 3rem;
+  color: var(--color-text-muted);
+}
+
+.error-card__message {
+  margin: 0.5rem 0 1.25rem;
+}
+
+@media (max-width: 640px) {
+  .header__inner {
+    gap: 0.75rem;
+  }
+
+  .header__user {
+    display: none;
+  }
+
+  .form--row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
