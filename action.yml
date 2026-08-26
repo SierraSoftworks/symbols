@@ -1,0 +1,129 @@
+name: Publish Debug Symbols
+description: >-
+  Extracts debug symbols from a built binary (ELF .debug via objcopy on Linux,
+  dSYM via dsymutil on macOS, the MSVC PDB on Windows) and publishes them to a
+  SierraSoftworks symbols server, authenticated with the workflow's GitHub
+  OIDC id-token. Requires `permissions: id-token: write`. On Linux and macOS
+  the binary is stripped in-place afterwards, so release assets and container
+  images keep their usual size.
+branding:
+  icon: layers
+  color: purple
+
+inputs:
+  binary:
+    description: Path to the built binary to extract symbols from.
+    required: true
+  version:
+    description: Release/version tag these symbols belong to (groups them for retention).
+    required: false
+    default: ${{ github.ref_name }}
+  server:
+    description: Base URL of the symbols server.
+    required: false
+    default: https://symbols.sierrasoftworks.com
+  audience:
+    description: OIDC audience expected by the symbols server.
+    required: false
+    default: symbols.sierrasoftworks.com
+  attach-to-release:
+    description: Also attach the symbol file as an asset on the current GitHub release.
+    required: false
+    default: "false"
+  token:
+    description: GitHub token used only when attach-to-release is enabled.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  build-id:
+    description: The build identifier derived by the server.
+    value: ${{ steps.publish.outputs.build-id }}
+  symbol-file:
+    description: Path of the extracted symbol file.
+    value: ${{ steps.extract.outputs.symbol-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Extract debug symbols
+      id: extract
+      shell: bash
+      run: |
+        set -euo pipefail
+        BINARY="${{ inputs.binary }}"
+        if [ ! -f "$BINARY" ]; then
+          echo "::error::binary '$BINARY' does not exist" >&2
+          exit 1
+        fi
+
+        case "$RUNNER_OS" in
+          Linux)
+            SYMFILE="${BINARY}.debug"
+            # Keep the DWARF (compressed) and the symbol table in the split
+            # file, link the shipped binary to it, then strip the shipped
+            # binary back down to the size it would have had under cargo's
+            # own strip="debuginfo". Requires the build to have run with
+            # CARGO_PROFILE_RELEASE_STRIP=none (or strip = "none").
+            objcopy --only-keep-debug --compress-debug-sections=zlib "$BINARY" "$SYMFILE"
+            objcopy --add-gnu-debuglink="$SYMFILE" "$BINARY"
+            objcopy --strip-debug "$BINARY"
+            ;;
+          macOS)
+            dsymutil "$BINARY" -o "${BINARY}.dSYM"
+            SYMFILE="${BINARY}.dSYM/Contents/Resources/DWARF/$(basename "$BINARY")"
+            strip -S "$BINARY"
+            ;;
+          Windows)
+            SYMFILE="${BINARY%.exe}.pdb"
+            if [ ! -f "$SYMFILE" ]; then
+              echo "::error::expected PDB '$SYMFILE' next to the binary (is debug info enabled?)" >&2
+              exit 1
+            fi
+            ;;
+          *)
+            echo "::error::unsupported runner OS '$RUNNER_OS'" >&2
+            exit 1
+            ;;
+        esac
+
+        ls -la "$SYMFILE"
+        echo "symbol-file=$SYMFILE" >> "$GITHUB_OUTPUT"
+
+    - name: Publish to the symbols server
+      id: publish
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::no OIDC token available - add 'permissions: id-token: write' to the workflow" >&2
+          exit 1
+        fi
+
+        TOKEN="$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.audience }}" | jq -r .value)"
+
+        RESPONSE="$(curl -sSf -X POST \
+          "${{ inputs.server }}/api/v1/symbols?version=${{ inputs.version }}" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/octet-stream" \
+          --data-binary "@${{ steps.extract.outputs.symbol-file }}")"
+
+        echo "$RESPONSE" | jq .
+        echo "build-id=$(echo "$RESPONSE" | jq -r '.build_id')" >> "$GITHUB_OUTPUT"
+
+    - name: Attach symbols to the GitHub release
+      if: inputs.attach-to-release == 'true' && github.event_name == 'release'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        SYMFILE="${{ steps.extract.outputs.symbol-file }}"
+        # dSYM DWARF files carry no extension; name assets after the binary.
+        ASSET="$(basename "${{ inputs.binary }}").symbols"
+        case "$RUNNER_OS" in
+          Linux) ASSET="$(basename "${{ inputs.binary }}").debug" ;;
+          Windows) ASSET="$(basename "$SYMFILE")" ;;
+        esac
+        gh release upload "${{ github.event.release.tag_name }}" "$SYMFILE#$ASSET" --clobber

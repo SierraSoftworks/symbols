@@ -1,0 +1,42 @@
+[package]
+name = "symbols"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted debug-symbol server speaking the debuginfod protocol, with OIDC-authenticated publishing from CI."
+license = "MIT"
+repository = "https://github.com/SierraSoftworks/symbols"
+
+[dependencies]
+actix-web = "4.13"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+futures = "0.3"
+hex = "0.4"
+humantime-serde = "1.1"
+jsonwebtoken = "9"
+object = { version = "0.36", default-features = false, features = ["read"] }
+object_store = { version = "0.11", features = ["aws"] }
+pdb = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-batteries = { git = "https://github.com/sierrasoftworks/tracing-batteries-rs.git", features = [
+  "opentelemetry",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+# Line tables for symbolication; stripped at link time for local builds. CI
+# overrides strip via CARGO_PROFILE_RELEASE_STRIP=none and splits the debug
+# info out with the publish-symbols action instead.
+debug = 1
+strip = "debuginfo"

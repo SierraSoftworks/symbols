@@ -1,0 +1,45 @@
+# Example configuration for the symbols server. In production this file is
+# rendered by the Nomad pack's template (see SierraSoftworks/nomad-pack-registry,
+# packs/symbols) with secrets injected from Nomad variables.
+server:
+  # Public plane: debuginfod reads of public projects, uploads, management API.
+  public_addr: 0.0.0.0:8080
+  # Internal plane: identical routes, but reads are unrestricted. Only ever
+  # bind this to an address that is not reachable from the public internet.
+  internal_addr: 127.0.0.1:8081
+
+storage:
+  endpoint: http://127.0.0.1:3900
+  region: garage
+  bucket: symbols
+  access_key_id: EXAMPLE
+  secret_access_key: EXAMPLE
+
+github:
+  # Repositories in these organizations may upload symbols; their projects
+  # ("org/repo") are created automatically on first upload, seeded from the
+  # repository's own visibility.
+  trusted_orgs:
+    - SierraSoftworks
+  audience: symbols.sierrasoftworks.com
+  # Only accept uploads from release tags.
+  ref_prefixes:
+    - refs/tags/
+
+management:
+  # OIDC issuer whose bearer tokens grant access to the management API.
+  issuer: https://idp.example.com
+  audience: symbols.sierrasoftworks.com
+
+federation:
+  # Unknown build IDs are looked up here (distro symbols: glibc, openssl, ...)
+  # and cached in object storage. Set to null to disable.
+  upstream: https://debuginfod.elfutils.org
+  cache_limit_bytes: 268435456
+
+retention:
+  # Keep this many versions of each project's symbols (override per project
+  # via the management API); prune the upstream cache after 90 days unused.
+  default_keep_versions: 10
+  sweep_interval: 24h
+  upstream_cache_max_age: 2160h
