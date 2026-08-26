@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
-use object_store::{ObjectStore, PutPayload, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::compression::Compression;
@@ -242,7 +242,7 @@ impl Store {
             match self.inner.get(&encoded_path(base, compression)).await {
                 Ok(result) => {
                     return Ok(Some(StoredObject {
-                        stored_size: result.meta.size as u64,
+                        stored_size: result.meta.size,
                         compression,
                         result,
                     }));
@@ -318,7 +318,7 @@ impl Store {
         let mut stats = UpstreamStats::default();
         while let Some(meta) = entries.try_next().await? {
             stats.entries += 1;
-            stats.total_size += meta.size as u64;
+            stats.total_size += meta.size;
         }
         Ok(stats)
     }
