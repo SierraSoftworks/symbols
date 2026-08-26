@@ -16,6 +16,7 @@ GET /buildid/{build-id}/debuginfo
 Symbols are published by release pipelines with a plain `POST` — the build ID
 is derived server-side from the uploaded file itself (ELF GNU build ID,
 Mach-O `LC_UUID`, or PDB GUID+age), so uploads can never mislabel a lookup.
+Symbols travel and are stored gzipped, end to end (see [Compression](#compression)).
 
 ## How publishing works
 
@@ -41,8 +42,8 @@ steps:
 The action extracts the platform's symbol artifact (Linux: `objcopy
 --only-keep-debug` with zlib-compressed sections, then re-strips the binary so
 shipped artifacts keep their usual size; macOS: `dsymutil`; Windows: the MSVC
-PDB) and uploads it authenticated by the workflow's **GitHub OIDC id-token** —
-no secrets are configured anywhere.
+PDB), gzips it, and uploads it authenticated by the workflow's **GitHub OIDC
+id-token** — no secrets are configured anywhere.
 
 On the server side, the token's `repository` claim names the project
 (`org/repo`). Repositories in a **trusted organization** get their project
@@ -66,12 +67,36 @@ Unknown build IDs are federated to an upstream debuginfod server (default:
 `debuginfod.elfutils.org`, covering distro packages such as glibc) and cached
 in object storage, so consumers only ever need this one URL.
 
+## Compression
+
+DWARF compresses several-fold, and the same gzip stream serves the upload, the
+bucket and the download:
+
+- **Uploading** — send the body with `Content-Encoding: gzip` (the action
+  does; a body that is a gzip stream is recognised even without the header,
+  since no symbol format we accept can be mistaken for one). This is what
+  keeps large artifacts — a Rust dSYM passes 100MB easily — inside the request
+  body limits imposed by CDNs in front of the server. A body sent raw is
+  accepted and compressed server-side instead.
+- **At rest** — stored objects are the compressed bytes, under a `.gz` key.
+  A compressed upload is written through untouched.
+- **Downloading** — a client that advertises `Accept-Encoding: gzip` gets
+  those exact bytes back with `Content-Encoding: gzip`; no other client is
+  handed anything it didn't ask for, so requests without the header are
+  inflated as they stream out. Either way the server never holds a whole
+  symbol file in memory to serve it.
+
+Objects written before this all get served as they always were; the encoding
+of each is part of its key.
+
 ## Storage
 
 Everything lives in an S3-compatible bucket (Garage in production): symbol
 data, per-symbol metadata, the build-id index, the upstream cache, **and the
 project registry itself** — so projects are managed through the API rather
-than through config rollouts. A retention sweep keeps the newest N versions
+than through config rollouts. Symbols and cached upstream responses are held
+compressed; each symbol's metadata records both its `size` (the symbol file
+itself) and its `stored_size`. A retention sweep keeps the newest N versions
 per project (default 10, per-project override) and ages out the upstream
 cache, bounding growth.
 

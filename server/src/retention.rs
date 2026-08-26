@@ -91,6 +91,8 @@ mod tests {
             arch: None,
             version: version.to_string(),
             size: 1,
+            compression: crate::compression::Compression::Gzip,
+            stored_size: Some(1),
             uploaded_at: Utc::now() - Duration::days(age_days),
             uploaded_from: None,
             os: None,

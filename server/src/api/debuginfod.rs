@@ -1,16 +1,18 @@
 use std::sync::Arc;
 
-use actix_web::{HttpResponse, web};
+use actix_web::{HttpRequest, HttpResponse, http::header, web};
 use futures::{StreamExt, TryStreamExt};
 
 use super::{AppState, Plane};
+use crate::compression::{self, Compression};
 use crate::errors::Error;
 use crate::formats::sanitize_id;
-use crate::storage::Visibility;
+use crate::storage::{StoredObject, Visibility};
 
 /// `GET /buildid/{id}/debuginfo` — the debuginfod lookup protocol, as spoken
 /// by Pyroscope's symbolizer, elfutils tooling (`DEBUGINFOD_URLS`), gdb, etc.
 pub async fn get_debuginfo(
+    req: HttpRequest,
     state: web::Data<Arc<AppState>>,
     plane: web::Data<Plane>,
     path: web::Path<String>,
@@ -27,9 +29,9 @@ pub async fn get_debuginfo(
             _ => false,
         };
         if visible {
-            if let Some((size, result)) = state.store.get_symbol(&index.project, &id).await? {
+            if let Some(stored) = state.store.get_symbol(&index.project, &id).await? {
                 tracing::debug!(build_id = %id, project = %index.project, "Serving stored symbol");
-                return Ok(stream_response(size, result));
+                return Ok(stream_response(&req, stored));
             }
             // A dangling index entry (interrupted delete); fall through to
             // federation just like a plain miss.
@@ -37,7 +39,7 @@ pub async fn get_debuginfo(
         }
     }
 
-    federated_lookup(&state, &id).await
+    federated_lookup(&req, &state, &id).await
 }
 
 /// Any other debuginfod route (`/buildid/{id}/executable`, `/section/...`) is
@@ -46,28 +48,84 @@ pub async fn unsupported() -> HttpResponse {
     HttpResponse::NotFound().finish()
 }
 
-fn stream_response(size: u64, result: object_store::GetResult) -> HttpResponse {
-    let stream = result
-        .into_stream()
-        .map_err(|e| std::io::Error::other(format!("storage stream: {e}")));
+/// Streams a stored object out. Symbols are held gzipped, so a client that
+/// advertises gzip gets those bytes untouched — no inflation here, no
+/// re-compression at the edge, and a fraction of the bytes on the wire.
+/// Anyone else gets the same stream inflated on the way past.
+fn stream_response(req: &HttpRequest, stored: StoredObject) -> HttpResponse {
+    let stream = Box::pin(
+        stored
+            .result
+            .into_stream()
+            .map_err(|e| std::io::Error::other(format!("storage stream: {e}"))),
+    );
+
     let mut response = HttpResponse::Ok();
     response.content_type("application/octet-stream");
-    response.insert_header((actix_web::http::header::CONTENT_LENGTH, size));
-    response.streaming(stream)
+    // What comes back depends on what the client accepts, and there are caches
+    // (a CDN, at least) between us and it.
+    response.insert_header((header::VARY, "accept-encoding"));
+
+    match stored.compression {
+        Compression::None => {
+            response.insert_header((header::CONTENT_LENGTH, stored.stored_size));
+            response.streaming(stream)
+        }
+        Compression::Gzip if accepts_gzip(req) => {
+            response.insert_header((header::CONTENT_ENCODING, "gzip"));
+            response.insert_header((header::CONTENT_LENGTH, stored.stored_size));
+            response.streaming(stream)
+        }
+        // The inflated length isn't known without reading the whole object, so
+        // this response goes out chunked.
+        Compression::Gzip => response.streaming(compression::decode_stream(stream)),
+    }
+}
+
+/// Whether the client asked for gzip. Absence means no: the debuginfod clients
+/// in the wild (elfutils' libcurl client, gdb, Pyroscope's symbolizer) don't
+/// all negotiate content encodings, and handing gzip to one that didn't ask
+/// would hand it garbage.
+fn accepts_gzip(req: &HttpRequest) -> bool {
+    let Some(accepted) = req
+        .headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+
+    accepted.split(',').any(|entry| {
+        let mut parts = entry.split(';').map(str::trim);
+        let coding = parts.next().unwrap_or_default();
+        if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
+            return false;
+        }
+        // "gzip;q=0" is an explicit refusal.
+        parts
+            .find_map(|param| param.strip_prefix("q="))
+            .and_then(|q| q.trim().parse::<f32>().ok())
+            .map(|q| q > 0.0)
+            .unwrap_or(true)
+    })
 }
 
 /// On a local miss, consult the upstream debuginfod server (distro symbols:
 /// glibc, openssl, ...). Responses within the cache limit are persisted to
 /// object storage so each build ID is fetched from upstream at most once;
 /// larger responses stream straight through.
-async fn federated_lookup(state: &AppState, id: &str) -> Result<HttpResponse, Error> {
+async fn federated_lookup(
+    req: &HttpRequest,
+    state: &AppState,
+    id: &str,
+) -> Result<HttpResponse, Error> {
     let Some(upstream) = state.config.federation.upstream.as_deref().filter(|u| !u.is_empty()) else {
         return Err(Error::NotFound);
     };
 
-    if let Some((size, result)) = state.store.get_upstream(id).await? {
+    if let Some(stored) = state.store.get_upstream(id).await? {
         tracing::debug!(build_id = %id, "Serving upstream symbol from cache");
-        return Ok(stream_response(size, result));
+        return Ok(stream_response(req, stored));
     }
 
     let url = format!("{}/buildid/{id}/debuginfo", upstream.trim_end_matches('/'));
@@ -110,12 +168,26 @@ async fn federated_lookup(state: &AppState, id: &str) -> Result<HttpResponse, Er
     }
 
     let data = bytes::Bytes::from(buffer);
-    if let Err(e) = state.store.put_upstream(id, data.clone()).await {
-        // Cache writes are best-effort: the caller still gets their symbols
-        // during a storage outage.
-        tracing::warn!(build_id = %id, error = %e, "Failed to cache upstream symbol");
-    } else {
-        tracing::info!(build_id = %id, size = data.len(), "Cached upstream symbol");
+
+    // Cached entries are compressed like our own symbols, so the cache costs a
+    // fraction of the storage and re-serves without re-encoding.
+    let cacheable = data.clone();
+    match web::block(move || compression::compress(&cacheable)).await {
+        Ok(Ok(compressed)) => {
+            let stored_size = compressed.len();
+            // Cache writes are best-effort: the caller still gets their symbols
+            // during a storage outage.
+            if let Err(e) = state.store.put_upstream(id, compressed).await {
+                tracing::warn!(build_id = %id, error = %e, "Failed to cache upstream symbol");
+            } else {
+                let size = data.len();
+                tracing::info!(build_id = %id, size, stored_size, "Cached upstream symbol");
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(build_id = %id, error = %e, "Failed to compress upstream symbol")
+        }
+        Err(e) => tracing::warn!(build_id = %id, error = %e, "Compression task failed"),
     }
 
     Ok(HttpResponse::Ok()
@@ -131,6 +203,7 @@ mod tests {
     use actix_web::{App, test, web};
 
     use crate::api::{AppState, Plane, configure_internal, configure_public};
+    use crate::compression::{Compression, compress};
     use crate::config::Config;
     use crate::formats::{SymbolFormat, SymbolInfo};
     use crate::storage::{Project, Store, SymbolMeta, Visibility};
@@ -155,14 +228,35 @@ mod tests {
                 .unwrap();
         }
 
-        for (project, id, data) in [
-            ("SierraSoftworks/grey", "aabbccdd", &b"public symbols"[..]),
-            ("SierraSoftworks/mail-backup", "11223344", &b"internal symbols"[..]),
+        for (project, id, data, compression) in [
+            (
+                "SierraSoftworks/grey",
+                "aabbccdd",
+                &b"public symbols"[..],
+                Compression::Gzip,
+            ),
+            (
+                "SierraSoftworks/mail-backup",
+                "11223344",
+                &b"internal symbols"[..],
+                Compression::Gzip,
+            ),
+            // Stored before the server compressed at rest.
+            (
+                "SierraSoftworks/grey",
+                "99887766",
+                &b"legacy symbols"[..],
+                Compression::None,
+            ),
         ] {
             let info = SymbolInfo {
                 id: id.to_string(),
                 format: SymbolFormat::Elf,
                 arch: Some("aarch64".to_string()),
+            };
+            let stored = match compression {
+                Compression::Gzip => compress(data).unwrap(),
+                Compression::None => bytes::Bytes::copy_from_slice(data),
             };
             let meta = SymbolMeta {
                 id: id.to_string(),
@@ -170,22 +264,33 @@ mod tests {
                 arch: None,
                 version: "v1".to_string(),
                 size: data.len() as u64,
+                compression,
+                stored_size: Some(stored.len() as u64),
                 uploaded_at: chrono::Utc::now(),
                 uploaded_from: None,
                 os: None,
                 commit: None,
                 build_url: None,
             };
-            store
-                .put_symbol(project, &info, &meta, bytes::Bytes::from_static(data))
-                .await
-                .unwrap();
+            store.put_symbol(project, &info, &meta, stored).await.unwrap();
         }
 
         Arc::new(AppState::new(config, store, reqwest::Client::new()))
     }
 
     async fn get(state: &Arc<AppState>, plane: Plane, path: &str) -> (u16, Vec<u8>) {
+        let (status, body, _, _) = request(state, plane, path, None).await;
+        (status, body)
+    }
+
+    /// Returns the status, the raw body (undecoded) and the response's
+    /// `Content-Encoding` and `Vary` headers.
+    async fn request(
+        state: &Arc<AppState>,
+        plane: Plane,
+        path: &str,
+        accept_encoding: Option<&str>,
+    ) -> (u16, Vec<u8>, Option<String>, Option<String>) {
         let configure = match plane {
             Plane::Public => configure_public,
             Plane::Internal => configure_internal,
@@ -197,10 +302,23 @@ mod tests {
                 .configure(configure),
         )
         .await;
-        let response = test::call_service(&app, test::TestRequest::get().uri(path).to_request()).await;
+
+        let mut request = test::TestRequest::get().uri(path);
+        if let Some(encoding) = accept_encoding {
+            request = request.insert_header(("accept-encoding", encoding));
+        }
+
+        let response = test::call_service(&app, request.to_request()).await;
         let status = response.status().as_u16();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        let (encoding, vary) = (header("content-encoding"), header("vary"));
         let body = test::read_body(response).await.to_vec();
-        (status, body)
+        (status, body, encoding, vary)
     }
 
     #[actix_web::test]
@@ -231,6 +349,46 @@ mod tests {
         assert_eq!(body, b"public symbols");
         let (status, _) = get(&state, Plane::Public, "/buildid/zz!/debuginfo").await;
         assert_eq!(status, 400);
+    }
+
+    #[actix_web::test]
+    async fn compressed_symbols_pass_through_to_clients_that_accept_gzip() {
+        let state = seeded_state().await;
+        let (status, body, encoding, vary) =
+            request(&state, Plane::Public, "/buildid/aabbccdd/debuginfo", Some("gzip")).await;
+
+        assert_eq!(status, 200);
+        assert_eq!(encoding.as_deref(), Some("gzip"));
+        assert_eq!(vary.as_deref(), Some("accept-encoding"));
+        assert_eq!(
+            crate::compression::decompress(&body, 1 << 20).unwrap(),
+            &b"public symbols"[..],
+            "the client should receive the stored bytes verbatim"
+        );
+    }
+
+    #[actix_web::test]
+    async fn compressed_symbols_are_inflated_for_clients_that_do_not() {
+        let state = seeded_state().await;
+        for accept in [None, Some("br"), Some("gzip;q=0"), Some("deflate, gzip;q=0.0")] {
+            let (status, body, encoding, _) =
+                request(&state, Plane::Public, "/buildid/aabbccdd/debuginfo", accept).await;
+            assert_eq!(status, 200, "accept-encoding: {accept:?}");
+            assert_eq!(encoding, None, "accept-encoding: {accept:?}");
+            assert_eq!(body, b"public symbols", "accept-encoding: {accept:?}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn symbols_stored_before_compression_are_served_as_they_are() {
+        let state = seeded_state().await;
+        for accept in [None, Some("gzip")] {
+            let (status, body, encoding, _) =
+                request(&state, Plane::Public, "/buildid/99887766/debuginfo", accept).await;
+            assert_eq!(status, 200);
+            assert_eq!(encoding, None, "nothing to advertise for a plain object");
+            assert_eq!(body, b"legacy symbols");
+        }
     }
 
     #[actix_web::test]
