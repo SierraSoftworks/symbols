@@ -53,9 +53,9 @@ async fn render(
 ) -> HttpResponse {
     let title = body.title();
     let user = identity.map(|identity| symbols_ui::SessionUser {
-        subject: identity.subject.clone(),
-        name: identity.name.clone(),
-        email: identity.email.clone(),
+        subject: identity.subject().to_string(),
+        name: identity.name().map(str::to_string),
+        email: identity.email().map(str::to_string),
     });
     let html = symbols_ui::render(AppProps { user, body }).await;
     HttpResponse::build(status)

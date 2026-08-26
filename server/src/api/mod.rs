@@ -27,21 +27,15 @@ pub struct AppState {
     pub config: Config,
     pub store: Store,
     pub github_auth: Validator,
+    /// Validates every management token, whether it arrived as an API bearer
+    /// token or as the id-token from a browser sign-in: both are minted for
+    /// this server's OIDC client, so both carry its client id as audience.
     pub management_auth: Validator,
     /// Signs/verifies the browser session and login-state cookies.
     pub sessions: Sessions,
-    /// Present when browser sign-in (`management.oidc`) is configured.
-    pub oidc: Option<OidcRuntime>,
+    /// The management issuer's authorization/token endpoints, for sign-in.
+    pub oidc_endpoints: oidc::EndpointCache,
     pub http: reqwest::Client,
-}
-
-/// Everything the browser sign-in flow needs beyond static config.
-pub struct OidcRuntime {
-    /// Validates the id-tokens produced by the code exchange. Distinct from
-    /// `management_auth`: id-tokens carry the OAuth client id as audience,
-    /// while bearer API tokens carry `management.audience`.
-    pub id_tokens: Validator,
-    pub endpoints: oidc::EndpointCache,
 }
 
 impl AppState {
@@ -52,24 +46,13 @@ impl AppState {
             }
             None => Sessions::ephemeral(config.management.session_duration),
         };
-        let oidc = config.management.oidc.as_ref().map(|oidc_config| OidcRuntime {
-            id_tokens: Validator::new(
-                http.clone(),
-                &config.management.issuer,
-                &oidc_config.client_id,
-            ),
-            endpoints: oidc::EndpointCache::new(http.clone(), &config.management.issuer),
-        });
+        let oidc = &config.management.oidc;
 
         Self {
             github_auth: Validator::new(http.clone(), &config.github.issuer, &config.github.audience),
-            management_auth: Validator::new(
-                http.clone(),
-                &config.management.issuer,
-                &config.management.audience,
-            ),
+            management_auth: Validator::new(http.clone(), &oidc.issuer, &oidc.client_id),
+            oidc_endpoints: oidc::EndpointCache::new(http.clone(), &oidc.issuer),
             sessions,
-            oidc,
             store,
             http,
             config,

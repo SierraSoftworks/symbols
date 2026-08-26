@@ -108,7 +108,7 @@ pub async fn update_settings(
 
     tracing::info!(
         project = %project.name,
-        by = %identity.subject,
+        by = %identity.subject(),
         visibility = ?project.visibility,
         keep_versions = ?project.keep_versions,
         "Updated project settings via UI"
@@ -178,7 +178,7 @@ pub async fn sweep(
 
     let summary = crate::retention::sweep(&state).await?;
     tracing::info!(
-        by = %identity.subject,
+        by = %identity.subject(),
         symbols_pruned = summary.symbols_pruned,
         upstream_dropped = summary.upstream_dropped,
         "Manual retention sweep via UI"

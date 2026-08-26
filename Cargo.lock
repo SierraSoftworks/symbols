@@ -1000,6 +1000,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "filt-rs"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1f92a904c1eadc902213cf932d9db85eb154eebcb3667b3027d5829b3ae55d"
+dependencies = [
+ "human-errors",
+ "regex",
+ "serde",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,6 +1524,12 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "human-errors"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef44dcc0e508d433319e72dcd65819757dde3f756b17f91e875a43d0b65bb7cb"
 
 [[package]]
 name = "humantime"
@@ -3412,6 +3429,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "filt-rs",
  "flate2",
  "futures",
  "hex",

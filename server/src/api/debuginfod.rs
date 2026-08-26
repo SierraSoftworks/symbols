@@ -209,7 +209,12 @@ mod tests {
     use crate::storage::{Project, Store, SymbolMeta, Visibility};
 
     async fn seeded_state() -> Arc<AppState> {
-        let config = Config::test();
+        seeded_state_with(|_| {}).await
+    }
+
+    async fn seeded_state_with(configure: impl FnOnce(&mut Config)) -> Arc<AppState> {
+        let mut config = Config::test();
+        configure(&mut config);
         let store = Store::in_memory();
 
         for (name, visibility) in [
@@ -440,17 +445,29 @@ mod tests {
         );
     }
 
+    /// A session cookie for a signed-in user, as the sign-in flow would mint
+    /// it: the claims the issuer asserted, verbatim.
+    fn session_for(state: &Arc<AppState>) -> String {
+        state
+            .sessions
+            .issue_session(&crate::auth::Identity::new(
+                serde_json::json!({
+                    "sub": "user-1",
+                    "email": "benjamin@example.com",
+                    "name": "Benjamin",
+                    "groups": ["readers"],
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ))
+            .unwrap()
+    }
+
     #[actix_web::test]
     async fn session_cookie_grants_access_to_ui_and_api() {
         let state = seeded_state().await;
-        let session = state
-            .sessions
-            .issue_session(&crate::auth::Identity {
-                subject: "user-1".to_string(),
-                email: Some("benjamin@example.com".to_string()),
-                name: Some("Benjamin".to_string()),
-            })
-            .unwrap();
+        let session = session_for(&state);
 
         let app = test::init_service(
             App::new()
@@ -490,5 +507,83 @@ mod tests {
         let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
         assert!(body.contains("Benjamin"));
         assert!(body.contains("SierraSoftworks/grey"));
+    }
+
+    #[actix_web::test]
+    async fn the_acl_gates_an_authenticated_session() {
+        // A read-only ACL: this user's group may look, but not touch.
+        let state = seeded_state_with(|config| {
+            config.management.acl =
+                filt_rs::Filter::new(r#"claims.groups contains "owners" || method == "GET""#)
+                    .unwrap();
+        })
+        .await;
+        let session = session_for(&state);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state.clone()))
+                .app_data(web::Data::new(Plane::Internal))
+                .configure(configure_internal),
+        )
+        .await;
+        let with_session = || {
+            actix_web::cookie::Cookie::new(crate::auth::SESSION_COOKIE, session.clone())
+        };
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/projects")
+                .cookie(with_session())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 200, "reads are permitted");
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::delete()
+                .uri("/api/v1/projects/SierraSoftworks/grey/symbols/aabbccdd")
+                .cookie(with_session())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 403, "writes are not");
+        // The symbol is still there.
+        let (status, _) = get(&state, Plane::Internal, "/buildid/aabbccdd/debuginfo").await;
+        assert_eq!(status, 200);
+    }
+
+    #[actix_web::test]
+    async fn an_acl_rejection_renders_a_403_page_rather_than_looping_sign_in() {
+        let state = seeded_state_with(|config| {
+            config.management.acl = filt_rs::Filter::new("false").unwrap();
+        })
+        .await;
+        let session = session_for(&state);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state.clone()))
+                .app_data(web::Data::new(Plane::Internal))
+                .configure(configure_internal),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/")
+                .cookie(actix_web::cookie::Cookie::new(
+                    crate::auth::SESSION_COOKIE,
+                    session,
+                ))
+                .to_request(),
+        )
+        .await;
+        // A 302 back to /auth/login here would bounce the user round the
+        // sign-in flow forever, since signing in again changes nothing.
+        assert_eq!(response.status().as_u16(), 403);
+        let body = String::from_utf8(test::read_body(response).await.to_vec()).unwrap();
+        assert!(body.contains("not permitted"), "unexpected body: {body}");
     }
 }

@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
-    if config.management.oidc.is_some() && config.management.session_secret.is_none() {
+    if config.management.session_secret.is_none() {
         tracing::warn!(
             "No management.session_secret configured; browser sessions will not survive restarts"
         );
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         public = %state.config.server.public_addr,
         internal = %state.config.server.internal_addr,
         trusted_orgs = ?state.config.github.trusted_orgs,
-        ui_sign_in = state.oidc.is_some(),
+        management_acl = %state.config.management.acl.raw(),
         "Starting symbols server"
     );
 
