@@ -622,6 +622,8 @@ checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
 dependencies = [
  "brotli",
  "compression-core",
+ "flate2",
+ "memchr",
 ]
 
 [[package]]
@@ -3385,10 +3387,12 @@ name = "symbols"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "async-compression",
  "base64 0.23.1",
  "bytes",
  "chrono",
  "clap",
+ "flate2",
  "futures",
  "hex",
  "humantime-serde",
@@ -3405,6 +3409,7 @@ dependencies = [
  "symbols-ui",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-batteries",
  "url",

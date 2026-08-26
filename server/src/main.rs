@@ -5,6 +5,7 @@ use clap::Parser;
 
 mod api;
 mod auth;
+mod compression;
 mod config;
 mod errors;
 mod formats;
@@ -12,10 +13,6 @@ mod retention;
 mod storage;
 
 use api::{AppState, Plane};
-
-/// Uploads up to this size are accepted; the largest artifacts are full-DWARF
-/// debug files, which stay well under this.
-const MAX_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -64,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         App::new()
             .app_data(web::Data::new(public_state.clone()))
             .app_data(web::Data::new(Plane::Public))
-            .app_data(web::PayloadConfig::new(MAX_UPLOAD_BYTES))
             .configure(api::configure_public)
     })
     .bind(&state.config.server.public_addr)?
@@ -75,7 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         App::new()
             .app_data(web::Data::new(internal_state.clone()))
             .app_data(web::Data::new(Plane::Internal))
-            .app_data(web::PayloadConfig::new(MAX_UPLOAD_BYTES))
             .configure(api::configure_internal)
     })
     .bind(&state.config.server.internal_addr)?

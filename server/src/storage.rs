@@ -5,6 +5,7 @@ use futures::TryStreamExt;
 use object_store::{ObjectStore, PutPayload, path::Path};
 use serde::{Deserialize, Serialize};
 
+use crate::compression::Compression;
 use crate::config::StorageConfig;
 use crate::errors::Error;
 use crate::formats::{SymbolFormat, SymbolInfo};
@@ -44,7 +45,16 @@ pub struct SymbolMeta {
     /// for retention. Untagged uploads share the "" pseudo-version.
     #[serde(default)]
     pub version: String,
+    /// The symbol file's own size, before storage compression.
     pub size: u64,
+    /// How the stored object is encoded. Objects written before the server
+    /// compressed at rest carry no value here and read back as `none`.
+    #[serde(default)]
+    pub compression: Compression,
+    /// Size of the object as stored; absent on those older objects, where it
+    /// is the same as `size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_size: Option<u64>,
     pub uploaded_at: DateTime<Utc>,
     /// The `ref` claim of the uploading workflow, for audit purposes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,8 +95,11 @@ fn project_path(name: &str) -> Path {
     Path::from(format!("projects/{name}/.project.json"))
 }
 
-fn symbol_data_path(project: &str, id: &str) -> Path {
-    Path::from(format!("projects/{project}/{id}/debuginfo"))
+/// Stored objects append the encoding's suffix to this base (`debuginfo.gz`
+/// for gzip), so the lookup path learns how to serve an object from its key
+/// rather than by reading its metadata.
+fn symbol_data_base(project: &str, id: &str) -> String {
+    format!("projects/{project}/{id}/debuginfo")
 }
 
 fn symbol_meta_path(project: &str, id: &str) -> Path {
@@ -97,8 +110,22 @@ fn index_path(id: &str) -> Path {
     Path::from(format!("buildids/{id}"))
 }
 
-fn upstream_path(id: &str) -> Path {
-    Path::from(format!("_upstream/{id}/debuginfo"))
+fn upstream_base(id: &str) -> String {
+    format!("_upstream/{id}/debuginfo")
+}
+
+fn encoded_path(base: &str, compression: Compression) -> Path {
+    Path::from(format!("{base}{}", compression.suffix()))
+}
+
+/// An object as it sits in storage, ready to be streamed to a client either
+/// verbatim or through a decoder.
+pub struct StoredObject {
+    /// Size of the object on disk — the compressed size unless `compression`
+    /// is `None`.
+    pub stored_size: u64,
+    pub compression: Compression,
+    pub result: object_store::GetResult,
 }
 
 impl Store {
@@ -176,6 +203,9 @@ impl Store {
 
     // --- Symbols ----------------------------------------------------------
 
+    /// Writes a symbol. `data` is already encoded as `meta.compression` says —
+    /// the upload path stores the bytes it received rather than transcoding
+    /// them.
     pub async fn put_symbol(
         &self,
         project: &str,
@@ -184,7 +214,10 @@ impl Store {
         data: bytes::Bytes,
     ) -> Result<(), Error> {
         self.inner
-            .put(&symbol_data_path(project, &info.id), PutPayload::from(data))
+            .put(
+                &encoded_path(&symbol_data_base(project, &info.id), meta.compression),
+                PutPayload::from(data),
+            )
             .await?;
         self.put_json(&symbol_meta_path(project, &info.id), meta).await?;
         self.put_json(
@@ -201,20 +234,30 @@ impl Store {
         self.get_json(&index_path(id)).await
     }
 
-    /// Returns the stored symbol as a byte stream plus its size.
-    pub async fn get_symbol(
-        &self,
-        project: &str,
-        id: &str,
-    ) -> Result<Option<(u64, object_store::GetResult)>, Error> {
-        match self.inner.get(&symbol_data_path(project, id)).await {
-            Ok(result) => {
-                let size = result.meta.size as u64;
-                Ok(Some((size, result)))
+    /// Fetches an object by trying each encoding's key in turn. Compressed is
+    /// tried first because everything written now is compressed; the plain key
+    /// is the fallback for objects stored before that.
+    async fn get_encoded(&self, base: &str) -> Result<Option<StoredObject>, Error> {
+        for compression in [Compression::Gzip, Compression::None] {
+            match self.inner.get(&encoded_path(base, compression)).await {
+                Ok(result) => {
+                    return Ok(Some(StoredObject {
+                        stored_size: result.meta.size as u64,
+                        compression,
+                        result,
+                    }));
+                }
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => return Err(e.into()),
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
         }
+        Ok(None)
+    }
+
+    /// Returns the stored symbol, ready to stream, with the encoding it is
+    /// stored in.
+    pub async fn get_symbol(&self, project: &str, id: &str) -> Result<Option<StoredObject>, Error> {
+        self.get_encoded(&symbol_data_base(project, id)).await
     }
 
     pub async fn list_symbols(&self, project: &str) -> Result<Vec<SymbolMeta>, Error> {
@@ -234,10 +277,14 @@ impl Store {
     pub async fn delete_symbol(&self, project: &str, id: &str) -> Result<(), Error> {
         // The index entry goes first: a dangling index is a served 404, while a
         // dangling data object is only an orphan the next sweep can ignore.
+        let data = symbol_data_base(project, id);
         for path in [
             index_path(id),
             symbol_meta_path(project, id),
-            symbol_data_path(project, id),
+            // Both encodings: which one is present depends on when it was
+            // uploaded, and a stale sibling would resurrect a deleted symbol.
+            encoded_path(&data, Compression::Gzip),
+            encoded_path(&data, Compression::None),
         ] {
             match self.inner.delete(&path).await {
                 Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
@@ -249,20 +296,18 @@ impl Store {
 
     // --- Upstream federation cache ---------------------------------------
 
-    pub async fn get_upstream(&self, id: &str) -> Result<Option<(u64, object_store::GetResult)>, Error> {
-        match self.inner.get(&upstream_path(id)).await {
-            Ok(result) => {
-                let size = result.meta.size as u64;
-                Ok(Some((size, result)))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+    pub async fn get_upstream(&self, id: &str) -> Result<Option<StoredObject>, Error> {
+        self.get_encoded(&upstream_base(id)).await
     }
 
+    /// Caches an upstream symbol. `data` is already gzip-encoded, matching how
+    /// our own symbols are stored.
     pub async fn put_upstream(&self, id: &str, data: bytes::Bytes) -> Result<(), Error> {
         self.inner
-            .put(&upstream_path(id), PutPayload::from(data))
+            .put(
+                &encoded_path(&upstream_base(id), Compression::Gzip),
+                PutPayload::from(data),
+            )
             .await?;
         Ok(())
     }
@@ -319,6 +364,8 @@ mod tests {
             arch: Some("aarch64".to_string()),
             version: version.to_string(),
             size: 4,
+            compression: Compression::Gzip,
+            stored_size: Some(4),
             uploaded_at: Utc::now(),
             uploaded_from: Some("refs/tags/v1.0.0".to_string()),
             os: Some("linux".to_string()),
@@ -333,16 +380,22 @@ mod tests {
         let project = "SierraSoftworks/grey";
 
         store
-            .put_symbol(project, &info("abcd1234"), &meta("abcd1234", "v1.0.0"), bytes::Bytes::from_static(b"data"))
+            .put_symbol(
+                project,
+                &info("abcd1234"),
+                &meta("abcd1234", "v1.0.0"),
+                bytes::Bytes::from_static(b"data"),
+            )
             .await
             .unwrap();
 
         let index = store.get_index("abcd1234").await.unwrap().unwrap();
         assert_eq!(index.project, project);
 
-        let (size, result) = store.get_symbol(project, "abcd1234").await.unwrap().unwrap();
-        assert_eq!(size, 4);
-        assert_eq!(&result.bytes().await.unwrap()[..], b"data");
+        let stored = store.get_symbol(project, "abcd1234").await.unwrap().unwrap();
+        assert_eq!(stored.stored_size, 4);
+        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(&stored.result.bytes().await.unwrap()[..], b"data");
 
         let symbols = store.list_symbols(project).await.unwrap();
         assert_eq!(symbols.len(), 1);
@@ -351,6 +404,43 @@ mod tests {
         store.delete_symbol(project, "abcd1234").await.unwrap();
         assert!(store.get_index("abcd1234").await.unwrap().is_none());
         assert!(store.get_symbol(project, "abcd1234").await.unwrap().is_none());
+    }
+
+    /// Symbols written before the server compressed at rest sit at the
+    /// unsuffixed key with no `compression` in their metadata; they must keep
+    /// resolving, and deleting one must clear it.
+    #[tokio::test]
+    async fn legacy_uncompressed_objects_still_resolve() {
+        let store = Store::in_memory();
+        let project = "SierraSoftworks/grey";
+
+        let mut legacy = meta("deadbeef", "v0.9.0");
+        legacy.compression = Compression::None;
+        legacy.stored_size = None;
+        store
+            .put_symbol(project, &info("deadbeef"), &legacy, bytes::Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+
+        let stored = store.get_symbol(project, "deadbeef").await.unwrap().unwrap();
+        assert_eq!(stored.compression, Compression::None);
+        assert_eq!(&stored.result.bytes().await.unwrap()[..], b"data");
+
+        store.delete_symbol(project, "deadbeef").await.unwrap();
+        assert!(store.get_symbol(project, "deadbeef").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn upstream_cache_roundtrip() {
+        let store = Store::in_memory();
+        store
+            .put_upstream("cafebabe", bytes::Bytes::from_static(b"gzipped"))
+            .await
+            .unwrap();
+
+        let stored = store.get_upstream("cafebabe").await.unwrap().unwrap();
+        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(&stored.result.bytes().await.unwrap()[..], b"gzipped");
     }
 
     #[tokio::test]

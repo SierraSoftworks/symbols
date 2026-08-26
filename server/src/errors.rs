@@ -23,6 +23,9 @@ pub enum Error {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    #[error("payload too large: {0}")]
+    TooLarge(String),
+
     #[error("upstream error: {0}")]
     Upstream(String),
 
@@ -34,6 +37,7 @@ impl Error {
     fn status(&self) -> StatusCode {
         match self {
             Error::UnrecognisedFormat(_) | Error::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Error::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Unauthenticated(_) => StatusCode::UNAUTHORIZED,
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
             Error::NotFound => StatusCode::NOT_FOUND,
