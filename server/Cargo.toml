@@ -21,7 +21,7 @@ humantime-serde = "1.1"
 # provider feature, signing/validation panics at runtime.
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 object = { version = "0.40", default-features = false, features = ["read"] }
-object_store = { version = "0.11", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 pdb = "0.8"
 rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
