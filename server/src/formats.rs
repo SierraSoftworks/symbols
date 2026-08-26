@@ -121,13 +121,20 @@ pub fn sanitize_id(id: &str) -> Result<String, Error> {
     Ok(id.to_ascii_lowercase())
 }
 
+/// A minimal but valid ELF carrying a GNU build-id note — shared by tests
+/// that need a real identifiable symbol file.
+#[cfg(test)]
+pub(crate) fn minimal_elf_with_build_id(build_id: &[u8]) -> Vec<u8> {
+    tests::minimal_elf_with_build_id(build_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A minimal but spec-valid ELF64 (little-endian, aarch64) consisting of
     /// just an ELF header and one PT_NOTE segment holding a GNU build ID.
-    fn minimal_elf_with_build_id(build_id: &[u8]) -> Vec<u8> {
+    pub(crate) fn minimal_elf_with_build_id(build_id: &[u8]) -> Vec<u8> {
         let ehsize = 64u64;
         let phentsize = 56u64;
         let note_off = ehsize + phentsize;

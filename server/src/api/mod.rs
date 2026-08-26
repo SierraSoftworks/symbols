@@ -36,6 +36,8 @@ pub struct AppState {
     /// The management issuer's authorization/token endpoints, for sign-in.
     pub oidc_endpoints: oidc::EndpointCache,
     pub http: reqwest::Client,
+    /// Bounds concurrent upload-processing jobs (disk spool + gzip CPU).
+    pub jobs: tokio::sync::Semaphore,
 }
 
 impl AppState {
@@ -56,6 +58,7 @@ impl AppState {
             store,
             http,
             config,
+            jobs: tokio::sync::Semaphore::new(crate::processor::CONCURRENT_JOBS),
         }
     }
 }
@@ -73,7 +76,22 @@ fn configure_core(cfg: &mut web::ServiceConfig) {
             "/buildid/{id}/{section}",
             web::get().to(debuginfod::unsupported),
         )
-        .route("/api/v1/symbols", web::post().to(upload::upload_symbol));
+        .route("/api/v1/symbols", web::post().to(upload::upload_symbol))
+        // Chunked uploads, for symbol files too large for one request to
+        // carry through the CDN in front of the public plane.
+        .route("/api/v1/uploads", web::post().to(upload::create_upload))
+        .route(
+            "/api/v1/uploads/{id}/chunks/{index}",
+            web::put().to(upload::put_upload_chunk),
+        )
+        .route(
+            "/api/v1/uploads/{id}/complete",
+            web::post().to(upload::complete_upload),
+        )
+        .route(
+            "/api/v1/uploads/{id}",
+            web::get().to(upload::get_upload_status),
+        );
 }
 
 pub fn configure_public(cfg: &mut web::ServiceConfig) {

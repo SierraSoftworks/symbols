@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +80,64 @@ pub struct IndexEntry {
     pub project: String,
 }
 
+/// Where an upload session is in its lifecycle. `Pending` and `Processing`
+/// both mean "the worker owns it now" — the split only matters for recovery,
+/// where either state after a restart means the job must run again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadStatus {
+    /// Chunks are still arriving.
+    Uploading,
+    /// Complete was requested; a worker will pick it up.
+    Pending,
+    /// A worker is streaming it to its final destination.
+    Processing,
+    /// Done — `result` carries what the upload endpoint would have returned.
+    Complete,
+    /// The worker gave up — `error` says why.
+    Failed,
+}
+
+/// A chunked upload in progress. Sessions live in object storage (under
+/// `_staging/`) rather than in server memory, so an in-flight upload survives
+/// a restart and never depends on which replica a chunk lands on. The
+/// retention sweep prunes sessions that were never completed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSession {
+    pub id: String,
+    /// "org/repo" from the creating token's `repository` claim; every later
+    /// request on the session must present a token for the same repository.
+    pub project: String,
+    /// The repository's visibility claim, seeding the project if the upload
+    /// auto-creates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_visibility: Option<String>,
+    /// The uploading workflow's ref, recorded on the stored symbols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub status: UploadStatus,
+    /// Set when completion is requested: how many chunks make up the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<u32>,
+    /// On `Complete`: the response the upload endpoint would have returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// On `Failed`: what went wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The metadata query from the create call, replayed at completion.
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct UpstreamStats {
     pub entries: usize,
@@ -114,8 +172,75 @@ fn upstream_base(id: &str) -> String {
     format!("_upstream/{id}/debuginfo")
 }
 
+fn upload_session_path(id: &str) -> Path {
+    Path::from(format!("_staging/{id}/.upload.json"))
+}
+
+fn upload_chunk_path(id: &str, index: u32) -> Path {
+    Path::from(format!("_staging/{id}/chunks/{index:08}"))
+}
+
 fn encoded_path(base: &str, compression: Compression) -> Path {
     Path::from(format!("{base}{}", compression.suffix()))
+}
+
+/// A bounded-memory writer to one object: bytes go out as ~16MB multipart
+/// parts as they arrive, so writing a gigabyte-scale object costs the server
+/// a few buffers, never the object. Abandoning the writer without `finish`
+/// leaves at most an incomplete multipart upload for the store to expire.
+pub struct StreamingWriter {
+    inner: object_store::WriteMultipart,
+    written: u64,
+}
+
+/// Multipart part size. S3 requires ≥5MB for all but the last part; 16MB
+/// keeps part counts low without meaningfully raising memory use.
+const STREAM_PART_SIZE: usize = 16 * 1024 * 1024;
+
+/// How many parts may be in flight at once per writer.
+const STREAM_CONCURRENCY: usize = 4;
+
+impl StreamingWriter {
+    async fn open(store: &Arc<dyn ObjectStore>, path: Path) -> Result<Self, Error> {
+        let upload = store.put_multipart(&path).await?;
+        Ok(Self {
+            inner: object_store::WriteMultipart::new_with_chunk_size(upload, STREAM_PART_SIZE),
+            written: 0,
+        })
+    }
+
+    pub async fn write(&mut self, data: bytes::Bytes) -> Result<(), Error> {
+        self.inner
+            .wait_for_capacity(STREAM_CONCURRENCY)
+            .await
+            .map_err(Error::Storage)?;
+        self.written += data.len() as u64;
+        self.inner.put(data);
+        Ok(())
+    }
+
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Completes the object; nothing is visible at the path until this
+    /// succeeds.
+    pub async fn finish(self) -> Result<u64, Error> {
+        self.inner
+            .finish()
+            .await
+            .map_err(Error::Storage)?;
+        Ok(self.written)
+    }
+
+    /// Abandons the write, cleaning up any parts already uploaded.
+    pub async fn abort(self) -> Result<(), Error> {
+        self.inner
+            .abort()
+            .await
+            .map_err(Error::Storage)?;
+        Ok(())
+    }
 }
 
 /// An object as it sits in storage, ready to be streamed to a client either
@@ -203,9 +328,10 @@ impl Store {
 
     // --- Symbols ----------------------------------------------------------
 
-    /// Writes a symbol. `data` is already encoded as `meta.compression` says —
-    /// the upload path stores the bytes it received rather than transcoding
-    /// them.
+    /// Writes a symbol in one call. The serving path writes through
+    /// [`symbol_writer`](Self::symbol_writer) + [`put_symbol_meta`](Self::put_symbol_meta)
+    /// instead; this stays for tests seeding fixtures.
+    #[cfg(test)]
     pub async fn put_symbol(
         &self,
         project: &str,
@@ -323,6 +449,194 @@ impl Store {
         Ok(stats)
     }
 
+    // --- Chunked upload staging -------------------------------------------
+
+    pub async fn create_upload(&self, session: &UploadSession) -> Result<(), Error> {
+        self.put_json(&upload_session_path(&session.id), session).await
+    }
+
+    pub async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>, Error> {
+        self.get_json(&upload_session_path(id)).await
+    }
+
+    #[cfg(test)]
+    pub async fn put_upload_chunk(
+        &self,
+        id: &str,
+        index: u32,
+        data: bytes::Bytes,
+    ) -> Result<(), Error> {
+        self.inner
+            .put(&upload_chunk_path(id, index), PutPayload::from(data))
+            .await?;
+        Ok(())
+    }
+
+    /// Opens a bounded-memory streaming writer for one staged chunk.
+    pub async fn upload_chunk_writer(&self, id: &str, index: u32) -> Result<StreamingWriter, Error> {
+        StreamingWriter::open(&self.inner, upload_chunk_path(id, index)).await
+    }
+
+    /// Opens a bounded-memory streaming writer for a symbol's final object
+    /// (always the gzip-encoded key). The caller writes the data, then records
+    /// metadata with [`put_symbol_meta`](Self::put_symbol_meta).
+    pub async fn symbol_writer(&self, project: &str, id: &str) -> Result<StreamingWriter, Error> {
+        let path = encoded_path(&symbol_data_base(project, id), Compression::Gzip);
+        StreamingWriter::open(&self.inner, path).await
+    }
+
+    /// Records a symbol's metadata and build-id index entry; the data object
+    /// itself was already written through [`symbol_writer`](Self::symbol_writer).
+    pub async fn put_symbol_meta(
+        &self,
+        project: &str,
+        info: &SymbolInfo,
+        meta: &SymbolMeta,
+    ) -> Result<(), Error> {
+        self.put_json(&symbol_meta_path(project, &info.id), meta).await?;
+        self.put_json(
+            &index_path(&info.id),
+            &IndexEntry {
+                project: project.to_string(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn get_upload_chunk(&self, id: &str, index: u32) -> Result<Option<bytes::Bytes>, Error> {
+        match self.inner.get(&upload_chunk_path(id, index)).await {
+            Ok(result) => Ok(Some(result.bytes().await?)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Size of one staged chunk, or None if it was never uploaded.
+    pub async fn upload_chunk_size(&self, id: &str, index: u32) -> Result<Option<u64>, Error> {
+        match self.inner.head(&upload_chunk_path(id, index)).await {
+            Ok(meta) => Ok(Some(meta.size)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Streams the staged chunks of a session back in order as one contiguous
+    /// byte stream — the reassembled upload body, without ever holding it.
+    pub fn upload_body_stream(
+        &self,
+        id: &str,
+        chunks: u32,
+    ) -> futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> {
+        let inner = self.inner.clone();
+        let id = id.to_string();
+        futures::stream::iter(0..chunks)
+            .then(move |index| {
+                let inner = inner.clone();
+                let path = upload_chunk_path(&id, index);
+                async move {
+                    let result = inner
+                        .get(&path)
+                        .await
+                        .map_err(|e| std::io::Error::other(format!("reading {path}: {e}")))?;
+                    Ok::<_, std::io::Error>(
+                        result
+                            .into_stream()
+                            .map_err(|e| std::io::Error::other(format!("chunk stream: {e}"))),
+                    )
+                }
+            })
+            .try_flatten()
+            .boxed()
+    }
+
+    /// Every upload session currently staged, for recovery and the sweep.
+    pub async fn list_upload_sessions(&self) -> Result<Vec<UploadSession>, Error> {
+        let mut sessions = Vec::new();
+        let listing = self
+            .inner
+            .list_with_delimiter(Some(&Path::from("_staging")))
+            .await?;
+        for prefix in listing.common_prefixes {
+            let path = Path::from(format!("{prefix}/.upload.json"));
+            if let Some(session) = self.get_json::<UploadSession>(&path).await? {
+                sessions.push(session);
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Removes a session's staged chunks, leaving the session document (with
+    /// its result) behind for status polling until the sweep clears it.
+    pub async fn delete_upload_chunks(&self, id: &str) -> Result<(), Error> {
+        let prefix = Path::from(format!("_staging/{id}/chunks"));
+        let mut entries = self.inner.list(Some(&prefix));
+        let mut paths = Vec::new();
+        while let Some(meta) = entries.try_next().await? {
+            paths.push(meta.location);
+        }
+        for path in paths {
+            match self.inner.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a session and everything staged under it.
+    pub async fn delete_upload(&self, id: &str) -> Result<(), Error> {
+        let prefix = Path::from(format!("_staging/{id}"));
+        let mut entries = self.inner.list(Some(&prefix));
+        let mut paths = Vec::new();
+        while let Some(meta) = entries.try_next().await? {
+            paths.push(meta.location);
+        }
+        for path in paths {
+            match self.inner.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops upload sessions older than the cutoff — whole sessions at a
+    /// time, judged by the session's own creation time, so a slowly-arriving
+    /// chunk can never outlive its session document as an orphan. Objects
+    /// under `_staging/` with no session document at all (interrupted
+    /// deletes) go by their own age. Returns the number of sessions removed.
+    pub async fn prune_staging(&self, cutoff: DateTime<Utc>) -> Result<usize, Error> {
+        let mut dropped = 0;
+        let mut live = std::collections::HashSet::new();
+        for session in self.list_upload_sessions().await? {
+            if session.created_at < cutoff {
+                self.delete_upload(&session.id).await?;
+                dropped += 1;
+            } else {
+                live.insert(session.id);
+            }
+        }
+
+        // Orphaned objects: anything staged that no live session accounts for.
+        let mut entries = self.inner.list(Some(&Path::from("_staging")));
+        let mut stale = Vec::new();
+        while let Some(meta) = entries.try_next().await? {
+            let session_id = meta.location.as_ref().split('/').nth(1).unwrap_or("");
+            if !live.contains(session_id) && meta.last_modified < cutoff {
+                stale.push(meta.location);
+            }
+        }
+        for location in stale {
+            match self.inner.delete(&location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Drops upstream cache entries older than the cutoff; returns the number dropped.
     pub async fn prune_upstream(&self, cutoff: DateTime<Utc>) -> Result<usize, Error> {
         let mut dropped = 0;
@@ -428,6 +742,80 @@ mod tests {
 
         store.delete_symbol(project, "deadbeef").await.unwrap();
         assert!(store.get_symbol(project, "deadbeef").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_staging_roundtrip_and_prune() {
+        let store = Store::in_memory();
+        let session = UploadSession {
+            id: "aa".repeat(16),
+            project: "SierraSoftworks/analytics".to_string(),
+            repository_visibility: Some("public".to_string()),
+            git_ref: Some("refs/tags/v0.2.1".to_string()),
+            created_at: Utc::now(),
+            status: UploadStatus::Uploading,
+            chunks: None,
+            result: None,
+            error: None,
+            version: "v0.2.1".to_string(),
+            os: Some("linux".to_string()),
+            arch: None,
+            commit: None,
+            build_url: None,
+        };
+
+        store.create_upload(&session).await.unwrap();
+        let loaded = store.get_upload(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.project, session.project);
+        assert_eq!(loaded.version, "v0.2.1");
+
+        store
+            .put_upload_chunk(&session.id, 0, bytes::Bytes::from_static(b"first-"))
+            .await
+            .unwrap();
+        store
+            .put_upload_chunk(&session.id, 1, bytes::Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_upload_chunk(&session.id, 0).await.unwrap().unwrap(),
+            &b"first-"[..]
+        );
+        assert!(store.get_upload_chunk(&session.id, 2).await.unwrap().is_none());
+
+        // delete_upload clears the session and every staged chunk.
+        store.delete_upload(&session.id).await.unwrap();
+        assert!(store.get_upload(&session.id).await.unwrap().is_none());
+        assert!(store.get_upload_chunk(&session.id, 0).await.unwrap().is_none());
+
+        // prune_staging drops whole sessions older than the cutoff — the
+        // session document and every chunk staged under it.
+        store.create_upload(&session).await.unwrap();
+        store
+            .put_upload_chunk(&session.id, 0, bytes::Bytes::from_static(b"stale"))
+            .await
+            .unwrap();
+        let dropped = store
+            .prune_staging(Utc::now() + chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(dropped, 1, "one session, chunks and all");
+        assert!(store.get_upload(&session.id).await.unwrap().is_none());
+        assert!(store.get_upload_chunk(&session.id, 0).await.unwrap().is_none());
+
+        // A young session is untouched even when the sweep runs.
+        store.create_upload(&session).await.unwrap();
+        store
+            .put_upload_chunk(&session.id, 0, bytes::Bytes::from_static(b"fresh"))
+            .await
+            .unwrap();
+        let dropped = store
+            .prune_staging(Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(dropped, 0);
+        assert!(store.get_upload(&session.id).await.unwrap().is_some());
+        assert!(store.get_upload_chunk(&session.id, 0).await.unwrap().is_some());
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ humantime-serde = "1.1"
 # rust_crypto selects the process-level crypto provider; without exactly one
 # provider feature, signing/validation panics at runtime.
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+memmap2 = "0.9"
 object = { version = "0.40", default-features = false, features = ["read"] }
 object_store = { version = "0.14", features = ["aws"] }
 pdb = "0.8"
@@ -33,6 +34,7 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 sha2 = "0.10"
 symbols-ui = { path = "../ui" }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }

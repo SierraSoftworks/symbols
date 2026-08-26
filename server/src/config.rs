@@ -164,10 +164,18 @@ pub struct RetentionConfig {
     /// Upstream federation cache entries older than this are dropped.
     #[serde(with = "humantime_serde", default = "default_upstream_max_age")]
     pub upstream_cache_max_age: std::time::Duration,
+    /// Staged chunked uploads older than this are dropped — sessions whose
+    /// uploader never completed them.
+    #[serde(with = "humantime_serde", default = "default_staging_max_age")]
+    pub upload_staging_max_age: std::time::Duration,
 }
 
 const fn default_keep_versions() -> usize {
     10
+}
+
+const fn default_staging_max_age() -> std::time::Duration {
+    std::time::Duration::from_secs(24 * 3600)
 }
 
 const fn default_sweep_interval() -> std::time::Duration {
@@ -184,6 +192,7 @@ impl Default for RetentionConfig {
             default_keep_versions: default_keep_versions(),
             sweep_interval: default_sweep_interval(),
             upstream_cache_max_age: default_upstream_max_age(),
+            upload_staging_max_age: default_staging_max_age(),
         }
     }
 }

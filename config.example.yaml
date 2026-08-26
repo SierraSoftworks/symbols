@@ -68,3 +68,5 @@ retention:
   default_keep_versions: 10
   sweep_interval: 24h
   upstream_cache_max_age: 2160h
+  # Chunked-upload staging abandoned for longer than this is dropped.
+  upload_staging_max_age: 24h

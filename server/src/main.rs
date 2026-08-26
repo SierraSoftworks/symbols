@@ -9,6 +9,7 @@ mod compression;
 mod config;
 mod errors;
 mod formats;
+mod processor;
 mod retention;
 mod storage;
 
@@ -55,6 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     tokio::spawn(retention::run(state.clone()));
+    // Upload jobs interrupted by the previous shutdown pick back up: staging
+    // is durable, so a crash mid-processing costs a retry, not the symbols.
+    tokio::spawn(processor::recover(state.clone()));
 
     let public_state = state.clone();
     let public = HttpServer::new(move || {
