@@ -10,7 +10,7 @@ use crate::auth::{GithubClaims, bearer_token};
 use crate::compression::{self, Compression};
 use crate::errors::Error;
 use crate::formats::identify;
-use crate::storage::{Project, SymbolMeta, Visibility};
+use crate::storage::{Project, SymbolMeta, UploadSession, Visibility};
 
 /// Largest request body we will read. This is the encoded size — a gzipped
 /// upload of this size holds far more DWARF than any build produces.
@@ -20,6 +20,11 @@ const MAX_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
 /// needed to derive its build ID, so this bounds the server's footprint (and
 /// the damage a pathological compression ratio could do).
 const MAX_SYMBOL_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Chunked uploads accept at most this many parts. Combined with the body
+/// limit this is far beyond any real symbol file; it exists to bound the
+/// assembly loop.
+const MAX_UPLOAD_CHUNKS: u32 = 256;
 
 #[derive(Debug, Deserialize)]
 pub struct UploadQuery {
@@ -115,7 +120,28 @@ pub async fn upload_symbol(
     query: web::Query<UploadQuery>,
     payload: web::Payload,
 ) -> Result<HttpResponse, Error> {
-    let token = bearer_token(&req)?;
+    let claims = authorize_uploader(&req, &state).await?;
+
+    let mut query = query.into_inner();
+    normalize_metadata(&mut query);
+    validate_metadata(&query)?;
+
+    // The body is read only after the uploader has been authorized: it runs to
+    // hundreds of megabytes, and there is no reason to buffer that for a
+    // request we are about to reject.
+    let body = read_body(payload, &req, MAX_UPLOAD_BYTES).await?;
+
+    let encoding = declared_encoding(&req)?;
+    store_symbols(&state, &claims, &query, body, encoding).await
+}
+
+/// The shared upload authorization: a valid GitHub Actions OIDC token, from a
+/// repository in a trusted organization, running against an allowed ref.
+async fn authorize_uploader(
+    req: &HttpRequest,
+    state: &AppState,
+) -> Result<GithubClaims, Error> {
+    let token = bearer_token(req)?;
     let claims: GithubClaims = state.github_auth.validate(&token).await?;
 
     let trusted = state
@@ -141,21 +167,34 @@ pub async fn upload_symbol(
         }
     }
 
-    let mut query = query.into_inner();
-    normalize_metadata(&mut query);
-    validate_metadata(&query)?;
+    Ok(claims)
+}
 
-    // The body is read only after the uploader has been authorized: it runs to
-    // hundreds of megabytes, and there is no reason to buffer that for a
-    // request we are about to reject.
-    let body = read_body(payload, &req, MAX_UPLOAD_BYTES).await?;
+/// The tail of every upload, single-shot or chunked: work out the encoding,
+/// derive the build ID, resolve the project, and store the symbols.
+///
+/// `encoding` is the request's declared `Content-Encoding` where there was a
+/// single request to declare one; an assembled chunked body has none and
+/// relies on the gzip sniff.
+async fn store_symbols(
+    state: &AppState,
+    claims: &GithubClaims,
+    query: &UploadQuery,
+    body: Bytes,
+    encoding: Option<Compression>,
+) -> Result<HttpResponse, Error> {
     if body.is_empty() {
         return Err(Error::BadRequest("empty upload".to_string()));
     }
 
     // Everything is stored gzipped: a compressed upload is stored exactly as
     // it arrived, and a plain one is compressed here.
-    let (symbols, stored) = match body_encoding(&req, &body)? {
+    let encoding = match encoding {
+        Some(encoding) => encoding,
+        None if compression::looks_gzipped(&body) => Compression::Gzip,
+        None => Compression::None,
+    };
+    let (symbols, stored) = match encoding {
         Compression::Gzip => {
             let encoded = body.clone();
             let symbols =
@@ -246,6 +285,193 @@ pub async fn upload_symbol(
     })))
 }
 
+// --- Chunked uploads --------------------------------------------------------
+//
+// A single-request upload is bounded by whatever request-body limit the
+// smallest hop in front of the server imposes (a CDN's cap is typically
+// ~100MB). Large symbol files go up in parts instead:
+//
+//   POST /api/v1/uploads?version=...          -> { "upload_id": ... }
+//   PUT  /api/v1/uploads/{id}/chunks/{index}  (raw bytes, in order from 0)
+//   POST /api/v1/uploads/{id}/complete?chunks=N
+//
+// Chunks are staged in object storage under `_staging/{id}/`, so sessions
+// survive server restarts and abandoned ones are swept by retention.
+// Completion assembles the parts and feeds the result through exactly the
+// same pipeline as a single-shot upload; the assembled body is expected to be
+// the same gzipped stream the action would otherwise have POSTed whole.
+
+/// `POST /api/v1/uploads` — opens a chunked upload session. Authentication and
+/// metadata validation happen here, once; later requests on the session prove
+/// they come from the same repository.
+pub async fn create_upload(
+    req: HttpRequest,
+    state: web::Data<Arc<AppState>>,
+    query: web::Query<UploadQuery>,
+) -> Result<HttpResponse, Error> {
+    let claims = authorize_uploader(&req, &state).await?;
+
+    let mut query = query.into_inner();
+    normalize_metadata(&mut query);
+    validate_metadata(&query)?;
+
+    let session = UploadSession {
+        id: hex::encode(rand::random::<[u8; 16]>()),
+        project: claims.repository.clone(),
+        created_at: chrono::Utc::now(),
+        version: query.version,
+        os: query.os,
+        arch: query.arch,
+        commit: query.commit,
+        build_url: query.build_url,
+    };
+    state.store.create_upload(&session).await?;
+
+    tracing::info!(
+        upload_id = %session.id,
+        project = %session.project,
+        version = %session.version,
+        "Opened chunked upload session"
+    );
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "upload_id": session.id,
+        "max_chunks": MAX_UPLOAD_CHUNKS,
+    })))
+}
+
+/// `PUT /api/v1/uploads/{id}/chunks/{index}` — stages one part of the body.
+/// Parts carry raw slices of the (typically gzipped) file; no per-chunk
+/// encoding applies.
+pub async fn put_upload_chunk(
+    req: HttpRequest,
+    state: web::Data<Arc<AppState>>,
+    path: web::Path<(String, u32)>,
+    payload: web::Payload,
+) -> Result<HttpResponse, Error> {
+    let claims = authorize_uploader(&req, &state).await?;
+    let (id, index) = path.into_inner();
+    let session = load_session(&state, &id, &claims).await?;
+
+    if index >= MAX_UPLOAD_CHUNKS {
+        return Err(Error::BadRequest(format!(
+            "chunk index {index} is out of range (at most {MAX_UPLOAD_CHUNKS} chunks)"
+        )));
+    }
+
+    let body = read_body(payload, &req, MAX_UPLOAD_BYTES).await?;
+    if body.is_empty() {
+        return Err(Error::BadRequest("empty chunk".to_string()));
+    }
+
+    let size = body.len();
+    state.store.put_upload_chunk(&session.id, index, body).await?;
+
+    tracing::debug!(upload_id = %session.id, index, size, "Staged upload chunk");
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "received": index, "size": size })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompleteQuery {
+    /// How many chunks the client sent; completion fails if any of 0..N-1 is
+    /// missing, so a dropped part can never produce silently truncated
+    /// symbols.
+    pub chunks: u32,
+}
+
+/// `POST /api/v1/uploads/{id}/complete` — assembles the staged chunks and
+/// stores the result exactly as if it had arrived in one request.
+pub async fn complete_upload(
+    req: HttpRequest,
+    state: web::Data<Arc<AppState>>,
+    path: web::Path<String>,
+    query: web::Query<CompleteQuery>,
+) -> Result<HttpResponse, Error> {
+    let claims = authorize_uploader(&req, &state).await?;
+    let id = path.into_inner();
+    let session = load_session(&state, &id, &claims).await?;
+
+    let count = query.chunks;
+    if count == 0 || count > MAX_UPLOAD_CHUNKS {
+        return Err(Error::BadRequest(format!(
+            "chunk count must be between 1 and {MAX_UPLOAD_CHUNKS}"
+        )));
+    }
+
+    let body = assemble_chunks(&state.store, &session.id, count).await?;
+
+    let upload_query = UploadQuery {
+        version: session.version.clone(),
+        os: session.os.clone(),
+        arch: session.arch.clone(),
+        commit: session.commit.clone(),
+        build_url: session.build_url.clone(),
+    };
+
+    // Assembled bodies have no Content-Encoding of their own; the gzip sniff
+    // in store_symbols decides.
+    let response = store_symbols(&state, &claims, &upload_query, body, None).await?;
+
+    // Best-effort: an orphaned staging area is only storage, and the sweep
+    // clears it if this fails.
+    if let Err(e) = state.store.delete_upload(&session.id).await {
+        tracing::warn!(upload_id = %session.id, error = %e, "Failed to clear upload staging");
+    }
+
+    Ok(response)
+}
+
+/// Reads the staged chunks back in order and concatenates them, refusing a
+/// session with a gap (a dropped part must never become silently truncated
+/// symbols) or one that assembles past the body limit.
+async fn assemble_chunks(
+    store: &crate::storage::Store,
+    id: &str,
+    count: u32,
+) -> Result<Bytes, Error> {
+    let mut body = web::BytesMut::new();
+    for index in 0..count {
+        let chunk = store.get_upload_chunk(id, index).await?.ok_or_else(|| {
+            Error::BadRequest(format!("chunk {index} of {count} was never uploaded"))
+        })?;
+        if body.len() + chunk.len() > MAX_UPLOAD_BYTES {
+            return Err(Error::TooLarge(format!(
+                "assembled upload exceeds the {MAX_UPLOAD_BYTES} byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+/// Fetches a session and proves the caller owns it: the token's `repository`
+/// claim must match the one that opened the session, so one repository can
+/// never write into (or complete) another's upload. Session ids arrive from
+/// the client and are validated to the exact shape we mint before touching
+/// storage paths.
+async fn load_session(
+    state: &AppState,
+    id: &str,
+    claims: &GithubClaims,
+) -> Result<UploadSession, Error> {
+    if !valid_upload_id(id) {
+        return Err(Error::BadRequest("invalid upload id".to_string()));
+    }
+
+    let session = state
+        .store
+        .get_upload(id)
+        .await?
+        .ok_or(Error::NotFound)?;
+
+    if session.project != claims.repository {
+        // Indistinguishable from absent, so ids can't be probed across repos.
+        return Err(Error::NotFound);
+    }
+
+    Ok(session)
+}
+
 /// Buffers the request body without decoding it, so a compressed upload keeps
 /// the exact bytes we intend to store.
 async fn read_body(
@@ -278,23 +504,29 @@ async fn read_body(
     Ok(buffer.freeze())
 }
 
-/// How the body is encoded. `Content-Encoding` decides it; without one we
-/// sniff, since no symbol format we accept can be mistaken for gzip and a
-/// client that sent a `.gz` without the header still means it.
-fn body_encoding(req: &HttpRequest, body: &[u8]) -> Result<Compression, Error> {
+/// The request's declared `Content-Encoding`, if any. `None` falls back to
+/// sniffing the gzip magic in `store_symbols` — no symbol format we accept
+/// can be mistaken for gzip, and a client that sent a `.gz` without the
+/// header still meant it.
+fn declared_encoding(req: &HttpRequest) -> Result<Option<Compression>, Error> {
     match req
         .headers()
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
     {
-        Some(encoding) if encoding.eq_ignore_ascii_case("gzip") => Ok(Compression::Gzip),
+        Some(encoding) if encoding.eq_ignore_ascii_case("gzip") => Ok(Some(Compression::Gzip)),
         Some(encoding) if !encoding.eq_ignore_ascii_case("identity") => Err(Error::BadRequest(
             format!("unsupported Content-Encoding '{encoding}'; send the body raw or gzipped"),
         )),
-        _ if compression::looks_gzipped(body) => Ok(Compression::Gzip),
-        _ => Ok(Compression::None),
+        _ => Ok(None),
     }
+}
+
+/// Exactly the shape `create_upload` mints: 32 lowercase hex characters.
+/// Anything else never touches a storage path.
+fn valid_upload_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Runs a whole-file (de)compression off the worker threads.
@@ -330,26 +562,121 @@ mod tests {
 
     #[actix_web::test]
     async fn content_encoding_decides_how_the_body_is_read() {
-        let gzipped = compression::compress(b"\x7fELF").unwrap();
-
         assert_eq!(
-            body_encoding(&request(&[("content-encoding", "gzip")]), &gzipped).unwrap(),
-            Compression::Gzip
+            declared_encoding(&request(&[("content-encoding", "gzip")])).unwrap(),
+            Some(Compression::Gzip)
         );
+        // No declaration (or an explicit identity) defers to the gzip sniff
+        // in store_symbols.
+        assert_eq!(declared_encoding(&request(&[])).unwrap(), None);
         assert_eq!(
-            body_encoding(&request(&[]), b"\x7fELF...").unwrap(),
-            Compression::None
-        );
-        // Sniffed: a client that sent a .gz without saying so still meant it.
-        assert_eq!(body_encoding(&request(&[]), &gzipped).unwrap(), Compression::Gzip);
-        assert_eq!(
-            body_encoding(&request(&[("content-encoding", "identity")]), &gzipped).unwrap(),
-            Compression::Gzip
+            declared_encoding(&request(&[("content-encoding", "identity")])).unwrap(),
+            None
         );
         assert!(matches!(
-            body_encoding(&request(&[("content-encoding", "br")]), &gzipped),
+            declared_encoding(&request(&[("content-encoding", "br")])),
             Err(Error::BadRequest(_))
         ));
+    }
+
+    #[actix_web::test]
+    async fn assembles_chunks_in_order_and_refuses_gaps() {
+        let store = crate::storage::Store::in_memory();
+        let id = "cd".repeat(16);
+        // Out-of-order staging must not matter; assembly reads by index.
+        store
+            .put_upload_chunk(&id, 1, Bytes::from_static(b"world"))
+            .await
+            .unwrap();
+        store
+            .put_upload_chunk(&id, 0, Bytes::from_static(b"hello, "))
+            .await
+            .unwrap();
+
+        let body = assemble_chunks(&store, &id, 2).await.unwrap();
+        assert_eq!(body, &b"hello, world"[..]);
+
+        // Claiming a chunk that was never staged is an error, not truncation.
+        assert!(matches!(
+            assemble_chunks(&store, &id, 3).await,
+            Err(Error::BadRequest(_))
+        ));
+    }
+
+    /// The full completion path minus HTTP and auth: chunks staged out of
+    /// order assemble into a gzipped ELF, which store_symbols sniffs,
+    /// identifies and stores exactly as a single-shot upload would have.
+    #[actix_web::test]
+    async fn chunked_uploads_complete_like_single_shot_ones() {
+        let build_id = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let elf = crate::formats::minimal_elf_with_build_id(&build_id);
+        let gzipped = compression::compress(&elf).unwrap();
+
+        let state = AppState::new(
+            crate::config::Config::test(),
+            crate::storage::Store::in_memory(),
+            reqwest::Client::new(),
+        );
+
+        // Stage the gzipped stream in deliberately small chunks.
+        let id = "ef".repeat(16);
+        let parts: Vec<_> = gzipped.chunks(gzipped.len() / 3 + 1).collect();
+        for (index, part) in parts.iter().enumerate() {
+            state
+                .store
+                .put_upload_chunk(&id, index as u32, Bytes::copy_from_slice(part))
+                .await
+                .unwrap();
+        }
+
+        let body = assemble_chunks(&state.store, &id, parts.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(body, gzipped, "assembly must reproduce the original stream");
+
+        let claims = GithubClaims {
+            repository: "SierraSoftworks/analytics".to_string(),
+            repository_owner: "SierraSoftworks".to_string(),
+            repository_visibility: Some("public".to_string()),
+            git_ref: Some("refs/tags/v0.2.1".to_string()),
+        };
+        let query = UploadQuery {
+            version: "v0.2.1".to_string(),
+            os: Some("linux".to_string()),
+            arch: None,
+            commit: None,
+            build_url: None,
+        };
+
+        // No declared encoding, exactly like an assembled body: the sniff
+        // must recognise the gzip stream.
+        store_symbols(&state, &claims, &query, body, None).await.unwrap();
+
+        let expected_id = hex::encode(build_id);
+        let index = state.store.get_index(&expected_id).await.unwrap().unwrap();
+        assert_eq!(index.project, "SierraSoftworks/analytics");
+        let stored = state
+            .store
+            .get_symbol(&index.project, &expected_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(
+            stored.result.bytes().await.unwrap(),
+            gzipped,
+            "the stored bytes are the assembled upload, untranscoded"
+        );
+    }
+
+    #[actix_web::test]
+    async fn upload_ids_must_match_the_minted_shape() {
+        assert!(valid_upload_id(&"ab".repeat(16)));
+        assert!(!valid_upload_id(""));
+        assert!(!valid_upload_id("abc"));
+        assert!(!valid_upload_id(&"AB".repeat(16)), "uppercase is never minted");
+        assert!(!valid_upload_id(&"zz".repeat(16)));
+        assert!(!valid_upload_id("../projects/x/y/deadbeefdeadbeef"));
     }
 
     #[actix_web::test]

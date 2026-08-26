@@ -43,7 +43,13 @@ The action extracts the platform's symbol artifact (Linux: `objcopy
 --only-keep-debug` with zlib-compressed sections, then re-strips the binary so
 shipped artifacts keep their usual size; macOS: `dsymutil`; Windows: the MSVC
 PDB), gzips it, and uploads it authenticated by the workflow's **GitHub OIDC
-id-token** — no secrets are configured anywhere.
+id-token** — no secrets are configured anywhere. Files too large for a single
+request go up through the [chunked upload protocol](#chunked-uploads).
+
+Symbol trouble never blocks a release: if extraction or publishing fails, the
+action surfaces a workflow **warning** and the job carries on — symbols are a
+debugging aid, and losing one build's symbols is not worth blocking its
+release. Set `fail-on-error: true` to make failures fail the job instead.
 
 On the server side, the token's `repository` claim names the project
 (`org/repo`). Repositories in a **trusted organization** get their project
@@ -88,6 +94,31 @@ bucket and the download:
 
 Objects written before this all get served as they always were; the encoding
 of each is part of its key.
+
+## Chunked uploads
+
+A single request can only be as large as the smallest hop in front of the
+server allows — a CDN's request-body cap is typically ~100MB, and a large
+project's DWARF passes that even gzipped. Files that would not fit go up in
+parts:
+
+```
+POST /api/v1/uploads?version=...          -> { "upload_id": ... }
+PUT  /api/v1/uploads/{id}/chunks/{index}     (raw slices of the file, from 0)
+POST /api/v1/uploads/{id}/complete?chunks=N
+```
+
+Every request authenticates with the same OIDC id-token as a single-shot
+upload, and a session only accepts requests from the repository that opened
+it. Chunks are staged in object storage (so sessions survive server restarts),
+and completion assembles them and runs the result through exactly the same
+pipeline as `POST /api/v1/symbols` — same identification, same stored bytes.
+Completion fails if any chunk is missing, so a dropped part can never become
+silently truncated symbols. Sessions that are never completed are cleaned up
+by the retention sweep (`upload_staging_max_age`, default 24h).
+
+The publish action does all of this automatically: it uploads in one request
+when the gzipped file fits, and switches to 64MB chunks when it doesn't.
 
 ## Storage
 

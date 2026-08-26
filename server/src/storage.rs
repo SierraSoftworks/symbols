@@ -80,6 +80,29 @@ pub struct IndexEntry {
     pub project: String,
 }
 
+/// A chunked upload in progress. Sessions live in object storage (under
+/// `_staging/`) rather than in server memory, so an in-flight upload survives
+/// a restart and never depends on which replica a chunk lands on. The
+/// retention sweep prunes sessions that were never completed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSession {
+    pub id: String,
+    /// "org/repo" from the creating token's `repository` claim; every later
+    /// request on the session must present a token for the same repository.
+    pub project: String,
+    pub created_at: DateTime<Utc>,
+    /// The metadata query from the create call, replayed at completion.
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct UpstreamStats {
     pub entries: usize,
@@ -112,6 +135,14 @@ fn index_path(id: &str) -> Path {
 
 fn upstream_base(id: &str) -> String {
     format!("_upstream/{id}/debuginfo")
+}
+
+fn upload_session_path(id: &str) -> Path {
+    Path::from(format!("_staging/{id}/.upload.json"))
+}
+
+fn upload_chunk_path(id: &str, index: u32) -> Path {
+    Path::from(format!("_staging/{id}/chunks/{index:08}"))
 }
 
 fn encoded_path(base: &str, compression: Compression) -> Path {
@@ -323,6 +354,74 @@ impl Store {
         Ok(stats)
     }
 
+    // --- Chunked upload staging -------------------------------------------
+
+    pub async fn create_upload(&self, session: &UploadSession) -> Result<(), Error> {
+        self.put_json(&upload_session_path(&session.id), session).await
+    }
+
+    pub async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>, Error> {
+        self.get_json(&upload_session_path(id)).await
+    }
+
+    pub async fn put_upload_chunk(
+        &self,
+        id: &str,
+        index: u32,
+        data: bytes::Bytes,
+    ) -> Result<(), Error> {
+        self.inner
+            .put(&upload_chunk_path(id, index), PutPayload::from(data))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_upload_chunk(&self, id: &str, index: u32) -> Result<Option<bytes::Bytes>, Error> {
+        match self.inner.get(&upload_chunk_path(id, index)).await {
+            Ok(result) => Ok(Some(result.bytes().await?)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Removes a session and everything staged under it.
+    pub async fn delete_upload(&self, id: &str) -> Result<(), Error> {
+        let prefix = Path::from(format!("_staging/{id}"));
+        let mut entries = self.inner.list(Some(&prefix));
+        let mut paths = Vec::new();
+        while let Some(meta) = entries.try_next().await? {
+            paths.push(meta.location);
+        }
+        for path in paths {
+            match self.inner.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops staged upload data older than the cutoff — sessions whose
+    /// uploader died before completing. Returns the number of objects removed.
+    pub async fn prune_staging(&self, cutoff: DateTime<Utc>) -> Result<usize, Error> {
+        let mut dropped = 0;
+        let mut entries = self.inner.list(Some(&Path::from("_staging")));
+        let mut stale = Vec::new();
+        while let Some(meta) = entries.try_next().await? {
+            if meta.last_modified < cutoff {
+                stale.push(meta.location);
+            }
+        }
+        for location in stale {
+            match self.inner.delete(&location).await {
+                Ok(()) => dropped += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Drops upstream cache entries older than the cutoff; returns the number dropped.
     pub async fn prune_upstream(&self, cutoff: DateTime<Utc>) -> Result<usize, Error> {
         let mut dropped = 0;
@@ -428,6 +527,58 @@ mod tests {
 
         store.delete_symbol(project, "deadbeef").await.unwrap();
         assert!(store.get_symbol(project, "deadbeef").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_staging_roundtrip_and_prune() {
+        let store = Store::in_memory();
+        let session = UploadSession {
+            id: "aa".repeat(16),
+            project: "SierraSoftworks/analytics".to_string(),
+            created_at: Utc::now(),
+            version: "v0.2.1".to_string(),
+            os: Some("linux".to_string()),
+            arch: None,
+            commit: None,
+            build_url: None,
+        };
+
+        store.create_upload(&session).await.unwrap();
+        let loaded = store.get_upload(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.project, session.project);
+        assert_eq!(loaded.version, "v0.2.1");
+
+        store
+            .put_upload_chunk(&session.id, 0, bytes::Bytes::from_static(b"first-"))
+            .await
+            .unwrap();
+        store
+            .put_upload_chunk(&session.id, 1, bytes::Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_upload_chunk(&session.id, 0).await.unwrap().unwrap(),
+            &b"first-"[..]
+        );
+        assert!(store.get_upload_chunk(&session.id, 2).await.unwrap().is_none());
+
+        // delete_upload clears the session and every staged chunk.
+        store.delete_upload(&session.id).await.unwrap();
+        assert!(store.get_upload(&session.id).await.unwrap().is_none());
+        assert!(store.get_upload_chunk(&session.id, 0).await.unwrap().is_none());
+
+        // prune_staging drops whatever is older than the cutoff.
+        store.create_upload(&session).await.unwrap();
+        store
+            .put_upload_chunk(&session.id, 0, bytes::Bytes::from_static(b"stale"))
+            .await
+            .unwrap();
+        let dropped = store
+            .prune_staging(Utc::now() + chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(dropped, 2, "the session doc and its chunk");
+        assert!(store.get_upload(&session.id).await.unwrap().is_none());
     }
 
     #[tokio::test]

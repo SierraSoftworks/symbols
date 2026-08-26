@@ -5,7 +5,9 @@ description: >-
   SierraSoftworks symbols server, authenticated with the workflow's GitHub
   OIDC id-token. Requires `permissions: id-token: write`. On Linux and macOS
   the binary is stripped in-place afterwards, so release assets and container
-  images keep their usual size.
+  images keep their usual size. Symbol trouble never blocks a release: by
+  default a failed extraction or upload is reported as a warning and the job
+  carries on (set fail-on-error to make it fail instead).
 branding:
   icon: layers
   color: purple
@@ -47,6 +49,14 @@ inputs:
     description: GitHub token used only when attach-to-release is enabled.
     required: false
     default: ${{ github.token }}
+  fail-on-error:
+    description: >-
+      Fail the job when extraction or publishing fails. Off by default:
+      symbols are a debugging aid, and losing one build's symbols is not
+      worth blocking its release — failures surface as workflow warnings
+      instead.
+    required: false
+    default: "false"
 
 outputs:
   build-id:
@@ -61,6 +71,7 @@ runs:
   steps:
     - name: Extract debug symbols
       id: extract
+      continue-on-error: true
       shell: bash
       run: |
         set -euo pipefail
@@ -126,7 +137,8 @@ runs:
 
     - name: Publish to the symbols server
       id: publish
-      if: inputs.publish == 'true'
+      if: inputs.publish == 'true' && steps.extract.outcome == 'success'
+      continue-on-error: true
       shell: bash
       run: |
         set -euo pipefail
@@ -135,8 +147,13 @@ runs:
           exit 1
         fi
 
-        TOKEN="$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.audience }}" | jq -r .value)"
+        # Fetched fresh before every request: GitHub id-tokens expire after a
+        # few minutes, and a chunked upload of a large symbol file can
+        # outlive the token that started it.
+        fresh_token() {
+          curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.audience }}" | jq -r .value
+        }
 
         uri() { jq -rn --arg v "$1" '$v|@uri'; }
 
@@ -164,25 +181,66 @@ runs:
         QUERY="$QUERY&build_url=$(uri "$BUILD_URL")"
 
         # Symbols go up gzipped. DWARF compresses several-fold, which keeps
-        # large uploads (a Rust dSYM easily passes 100MB) inside the request
-        # body limits of any CDN in front of the server, and the server stores
-        # what it receives — so this costs neither side a re-encode.
+        # most uploads inside the request body limits of any CDN in front of
+        # the server, and the server stores what it receives — so this costs
+        # neither side a re-encode.
         SYMFILE="${{ steps.extract.outputs.symbol-file }}"
         gzip -c "$SYMFILE" > "$SYMFILE.gz"
         ls -la "$SYMFILE.gz"
 
-        RESPONSE="$(curl -sSf -X POST \
-          "${{ inputs.server }}/api/v1/symbols?$QUERY" \
-          -H "Authorization: Bearer $TOKEN" \
-          -H "Content-Type: application/octet-stream" \
-          -H "Content-Encoding: gzip" \
-          --data-binary "@$SYMFILE.gz")"
+        # Files that stay under the CDN's request cap even gzipped go up in
+        # one request; anything larger goes through the server's chunked
+        # upload protocol in CDN-sized parts.
+        SIZE="$(wc -c < "$SYMFILE.gz" | tr -d ' ')"
+        SINGLE_LIMIT=$((90 * 1024 * 1024))
+        CHUNK_SIZE=$((64 * 1024 * 1024))
+
+        if [ "$SIZE" -le "$SINGLE_LIMIT" ]; then
+          RESPONSE="$(curl -sSf -X POST \
+            "${{ inputs.server }}/api/v1/symbols?$QUERY" \
+            -H "Authorization: Bearer $(fresh_token)" \
+            -H "Content-Type: application/octet-stream" \
+            -H "Content-Encoding: gzip" \
+            --data-binary "@$SYMFILE.gz")"
+        else
+          echo "symbol file is $SIZE bytes gzipped; using a chunked upload"
+          UPLOAD_ID="$(curl -sSf -X POST \
+            "${{ inputs.server }}/api/v1/uploads?$QUERY" \
+            -H "Authorization: Bearer $(fresh_token)" | jq -r .upload_id)"
+
+          CHUNK_DIR="$RUNNER_TEMP/symbol-chunks"
+          rm -rf "$CHUNK_DIR" && mkdir -p "$CHUNK_DIR"
+          # Alphabetic suffixes (the default) sort lexically, so the glob
+          # below walks the parts in order on every platform's split.
+          split -b "$CHUNK_SIZE" "$SYMFILE.gz" "$CHUNK_DIR/chunk-"
+
+          INDEX=0
+          for CHUNK in "$CHUNK_DIR"/chunk-*; do
+            # Chunk PUTs are idempotent, so transient failures retry safely.
+            curl -sSf -X PUT --retry 2 \
+              "${{ inputs.server }}/api/v1/uploads/$UPLOAD_ID/chunks/$INDEX" \
+              -H "Authorization: Bearer $(fresh_token)" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$CHUNK" > /dev/null
+            echo "uploaded chunk $INDEX ($(wc -c < "$CHUNK" | tr -d ' ') bytes)"
+            INDEX=$((INDEX + 1))
+          done
+          rm -rf "$CHUNK_DIR"
+
+          RESPONSE="$(curl -sSf -X POST \
+            "${{ inputs.server }}/api/v1/uploads/$UPLOAD_ID/complete?chunks=$INDEX" \
+            -H "Authorization: Bearer $(fresh_token)")"
+        fi
 
         echo "$RESPONSE" | jq .
         echo "build-id=$(echo "$RESPONSE" | jq -r '.build_id')" >> "$GITHUB_OUTPUT"
 
     - name: Attach symbols to the GitHub release
-      if: inputs.publish == 'true' && inputs.attach-to-release == 'true' && github.event_name == 'release'
+      id: attach
+      if: >-
+        inputs.publish == 'true' && inputs.attach-to-release == 'true' &&
+        github.event_name == 'release' && steps.extract.outcome == 'success'
+      continue-on-error: true
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
@@ -196,3 +254,34 @@ runs:
           Windows) ASSET="$(basename "$SYMFILE")" ;;
         esac
         gh release upload "${{ github.event.release.tag_name }}" "$SYMFILE#$ASSET" --clobber
+
+    - name: Report symbol publishing outcome
+      if: always()
+      shell: bash
+      env:
+        EXTRACT: ${{ steps.extract.outcome }}
+        PUBLISH: ${{ steps.publish.outcome }}
+        ATTACH: ${{ steps.attach.outcome }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: |
+        set -euo pipefail
+        FAILED=""
+        [ "$EXTRACT" = "failure" ] && FAILED="symbol extraction"
+        [ "$PUBLISH" = "failure" ] && FAILED="${FAILED:+$FAILED, }symbol publishing"
+        [ "$ATTACH" = "failure" ] && FAILED="${FAILED:+$FAILED, }release-asset upload"
+
+        if [ -z "$FAILED" ]; then
+          exit 0
+        fi
+
+        if [ "$FAIL_ON_ERROR" = "true" ]; then
+          echo "::error::$FAILED failed - see the step logs above" >&2
+          exit 1
+        fi
+
+        # Symbols are a debugging aid; losing one build's symbols is not
+        # worth blocking its release. Surface the failure without failing.
+        echo "::warning::$FAILED failed - this build's debug symbols were not published, but the release continues (set fail-on-error: true to fail instead)"
+        if [ "$EXTRACT" = "failure" ]; then
+          echo "::warning::because extraction failed, the binary was not stripped - release artifacts may be larger than usual"
+        fi
