@@ -105,7 +105,13 @@ runs:
           Windows)
             SYMFILE="${BINARY%.exe}.pdb"
             if [ ! -f "$SYMFILE" ]; then
-              echo "::error::expected PDB '$SYMFILE' next to the binary (is debug info enabled, and did the build artifact include the PDB?)" >&2
+              # rustc names the MSVC PDB after the crate with hyphens
+              # replaced by underscores (git-tool.exe -> git_tool.pdb).
+              STEM="$(basename "${BINARY%.exe}" | tr '-' '_')"
+              SYMFILE="$(dirname "$BINARY")/$STEM.pdb"
+            fi
+            if [ ! -f "$SYMFILE" ]; then
+              echo "::error::expected a PDB next to the binary ('${BINARY%.exe}.pdb' or '$SYMFILE') - is debug info enabled, and did the build artifact include the PDB?" >&2
               exit 1
             fi
             ;;
