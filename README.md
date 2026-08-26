@@ -105,20 +105,36 @@ parts:
 ```
 POST /api/v1/uploads?version=...          -> { "upload_id": ... }
 PUT  /api/v1/uploads/{id}/chunks/{index}     (raw slices of the file, from 0)
-POST /api/v1/uploads/{id}/complete?chunks=N
+POST /api/v1/uploads/{id}/complete?chunks=N  -> { "state": "processing" }
+GET  /api/v1/uploads/{id}                    -> { "state": ..., "result": ... }
 ```
 
 Every request authenticates with the same OIDC id-token as a single-shot
 upload, and a session only accepts requests from the repository that opened
 it. Chunks are staged in object storage (so sessions survive server restarts),
-and completion assembles them and runs the result through exactly the same
-pipeline as `POST /api/v1/symbols` — same identification, same stored bytes.
-Completion fails if any chunk is missing, so a dropped part can never become
-silently truncated symbols. Sessions that are never completed are cleaned up
-by the retention sweep (`upload_staging_max_age`, default 24h).
+and completion verifies every part arrived — a dropped chunk is an error, not
+silently truncated symbols — then hands the body to a worker job and returns
+immediately; the client polls the status endpoint for the outcome, which on
+success carries the same payload the single-shot endpoint returns. Sessions
+that are never completed (and finished ones nobody polled) are cleaned up by
+the retention sweep (`upload_staging_max_age`, default 24h).
 
 The publish action does all of this automatically: it uploads in one request
-when the gzipped file fits, and switches to 64MB chunks when it doesn't.
+when the gzipped file fits, switches to 64MB chunks when it doesn't, and
+polls completion until the symbols land.
+
+### How uploads are processed
+
+Ingest never holds a body: request bytes stream straight into staging as
+bounded multipart parts, whatever their size. Once a body is durably staged,
+a worker job (at most two at a time) streams it through a gzip decoder into a
+spool file on disk, memory-maps that file to derive the build ID — the page
+cache stands in for the heap, so even gigabyte DWARF never becomes server
+memory — and then streams the staged bytes to their final object. Single-shot
+uploads run the same job inline and keep their synchronous response; chunked
+uploads are processed in the background behind the status endpoint. Because
+staging is durable and jobs are recorded on the session, a server crash loses
+nothing: interrupted jobs are re-run on startup.
 
 ## Storage
 

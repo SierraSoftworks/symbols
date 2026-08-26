@@ -36,6 +36,8 @@ pub struct AppState {
     /// The management issuer's authorization/token endpoints, for sign-in.
     pub oidc_endpoints: oidc::EndpointCache,
     pub http: reqwest::Client,
+    /// Bounds concurrent upload-processing jobs (disk spool + gzip CPU).
+    pub jobs: tokio::sync::Semaphore,
 }
 
 impl AppState {
@@ -56,6 +58,7 @@ impl AppState {
             store,
             http,
             config,
+            jobs: tokio::sync::Semaphore::new(crate::processor::CONCURRENT_JOBS),
         }
     }
 }
@@ -84,6 +87,10 @@ fn configure_core(cfg: &mut web::ServiceConfig) {
         .route(
             "/api/v1/uploads/{id}/complete",
             web::post().to(upload::complete_upload),
+        )
+        .route(
+            "/api/v1/uploads/{id}",
+            web::get().to(upload::get_upload_status),
         );
 }
 

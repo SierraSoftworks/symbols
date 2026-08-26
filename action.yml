@@ -230,6 +230,33 @@ runs:
           RESPONSE="$(curl -sSf -X POST \
             "${{ inputs.server }}/api/v1/uploads/$UPLOAD_ID/complete?chunks=$INDEX" \
             -H "Authorization: Bearer $(fresh_token)")"
+
+          # Completion is asynchronous: the server verifies the chunks and
+          # hands the body to a worker, and we poll until it lands. (An older
+          # server that still answers synchronously returns the result here.)
+          if [ "$(echo "$RESPONSE" | jq -r '.build_id // empty')" = "" ]; then
+            for _ in $(seq 1 120); do
+              STATE="$(echo "$RESPONSE" | jq -r '.state // "complete"')"
+              case "$STATE" in
+                complete)
+                  RESPONSE="$(echo "$RESPONSE" | jq '.result // .')"
+                  break
+                  ;;
+                failed)
+                  echo "::error::symbol processing failed: $(echo "$RESPONSE" | jq -r '.error // "unknown error"')" >&2
+                  exit 1
+                  ;;
+              esac
+              sleep 5
+              RESPONSE="$(curl -sSf \
+                "${{ inputs.server }}/api/v1/uploads/$UPLOAD_ID" \
+                -H "Authorization: Bearer $(fresh_token)")"
+            done
+            if [ "$(echo "$RESPONSE" | jq -r '.build_id // empty')" = "" ]; then
+              echo "::error::timed out waiting for the server to process the upload" >&2
+              exit 1
+            fi
+          fi
         fi
 
         echo "$RESPONSE" | jq .

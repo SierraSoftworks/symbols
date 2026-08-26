@@ -1,4 +1,6 @@
-use std::io::{Read, Write};
+use std::io::Write;
+#[cfg(test)]
+use std::io::Read;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -59,6 +61,7 @@ pub fn compress(data: &[u8]) -> Result<Bytes, Error> {
 /// Decompresses a whole gzip body, refusing anything that expands past
 /// `limit` — the result is held in memory to identify the file, so a
 /// pathological ratio must not be allowed to exhaust the server.
+#[cfg(test)]
 pub fn decompress(data: &[u8], limit: usize) -> Result<Bytes, Error> {
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(data)

@@ -24,7 +24,7 @@ pub async fn run(state: Arc<AppState>) {
 pub struct SweepSummary {
     pub symbols_pruned: usize,
     pub upstream_dropped: usize,
-    /// Staged chunked-upload objects removed (abandoned sessions).
+    /// Abandoned upload sessions removed, chunks and all.
     pub staging_dropped: usize,
 }
 
@@ -55,8 +55,10 @@ pub async fn sweep(state: &AppState) -> Result<SweepSummary, Error> {
         tracing::info!(dropped = summary.upstream_dropped, "Pruned upstream federation cache");
     }
 
-    // Anything still staged after this long belongs to an uploader that died
-    // mid-flight; a healthy session lives for minutes.
+    // Any session still staged after this long belongs to an uploader that
+    // died mid-flight (or a result nobody polled); a healthy session lives
+    // for minutes. Whole sessions go at once, so a trickling upload can
+    // never decay into orphaned chunks.
     let staging_cutoff = chrono::Utc::now()
         - chrono::Duration::from_std(state.config.retention.upload_staging_max_age)
             .unwrap_or_else(|_| chrono::Duration::days(1));
