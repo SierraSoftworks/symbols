@@ -1,7 +1,9 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use actix_web::body::{self, SizedStream};
-use actix_web::http::{Method, header};
+use actix_web::http::header::{self, ContentRange, ContentRangeSpec, Header, Range as RangeHeader};
+use actix_web::http::{Method, StatusCode};
 use actix_web::{HttpRequest, HttpResponse, HttpResponseBuilder, web};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
@@ -58,7 +60,7 @@ pub async fn unsupported() -> HttpResponse {
 
 /// Where a served object lives. Locally published symbols and the federated
 /// upstream cache are stored the same way, so one response path — content
-/// negotiation, HEAD — covers both.
+/// negotiation, HEAD, byte ranges — covers both.
 #[derive(Clone, Copy)]
 enum Source<'a> {
     Symbol { project: &'a str, id: &'a str },
@@ -73,10 +75,14 @@ impl Source<'_> {
         }
     }
 
-    async fn get(&self, store: &Store) -> Result<Option<StoredObject>, Error> {
+    async fn get(
+        &self,
+        store: &Store,
+        range: Option<Range<u64>>,
+    ) -> Result<Option<StoredObject>, Error> {
         match *self {
-            Source::Symbol { project, id } => store.get_symbol(project, id).await,
-            Source::Upstream { id } => store.get_upstream(id).await,
+            Source::Symbol { project, id } => store.get_symbol(project, id, range).await,
+            Source::Upstream { id } => store.get_upstream(id, range).await,
         }
     }
 }
@@ -95,15 +101,18 @@ async fn serve(
     source: Source<'_>,
 ) -> Result<Option<HttpResponse>, Error> {
     let head_only = req.method() == Method::HEAD;
-    // A HEAD is decided on the object's metadata alone, so no body is fetched
-    // only to be dropped. A GET goes straight for the object.
-    let (info, object) = if head_only {
+    // Anything that may end without a body — a HEAD, a 416 — or with a slice
+    // of it is decided on the object's metadata alone, so no body is fetched
+    // only to be dropped. A plain GET goes straight for the object.
+    let metadata_first = head_only || req.headers().contains_key(header::RANGE);
+
+    let (info, object) = if metadata_first {
         match source.head(store).await? {
             Some(info) => (info, None),
             None => return Ok(None),
         }
     } else {
-        match source.get(store).await? {
+        match source.get(store, None).await? {
             Some(object) => (object.info.clone(), Some(object)),
             None => return Ok(None),
         }
@@ -114,14 +123,41 @@ async fn serve(
     // object), as opposed to inflated on the way past.
     let verbatim = gzip || info.compression == Compression::None;
 
-    let mut response = HttpResponse::Ok();
+    // Byte ranges apply to the bytes we send untouched — the stored object,
+    // which storage reads as a range — never to an inflated response: a range
+    // of *that* representation could only be served by inflating from the
+    // start. There, `Accept-Ranges: none` says so and any Range is ignored.
+    let range = if verbatim && !head_only {
+        requested_range(req, info.stored_size)
+    } else {
+        RangeOutcome::Full
+    };
+
+    let mut response = HttpResponse::build(match range {
+        RangeOutcome::Full => StatusCode::OK,
+        RangeOutcome::Partial(_) => StatusCode::PARTIAL_CONTENT,
+        RangeOutcome::Unsatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+    });
     response.content_type("application/octet-stream");
     // What comes back depends on what the client accepts, and there are caches
     // (a CDN, at least) between us and it.
     response.insert_header((header::VARY, "accept-encoding"));
+    response.insert_header((header::ACCEPT_RANGES, if verbatim { "bytes" } else { "none" }));
     if gzip {
         response.insert_header((header::CONTENT_ENCODING, "gzip"));
     }
+
+    let partial = match range {
+        RangeOutcome::Unsatisfiable => {
+            response.insert_header(ContentRange(ContentRangeSpec::Bytes {
+                range: None,
+                instance_length: Some(info.stored_size),
+            }));
+            return Ok(Some(response.finish()));
+        }
+        RangeOutcome::Partial(range) => Some(range),
+        RangeOutcome::Full => None,
+    };
 
     if head_only {
         // The length the GET would carry, and no body. The inflated length
@@ -136,11 +172,12 @@ async fn serve(
 
     let object = match object {
         Some(object) => object,
-        None => match source.get(store).await? {
+        None => match source.get(store, partial).await? {
             Some(object) => object,
             None => return Ok(None),
         },
     };
+    let served = object.range.clone();
     let stream: ByteStream = Box::pin(
         object
             .result
@@ -149,7 +186,13 @@ async fn serve(
     );
 
     Ok(Some(if verbatim {
-        sized(&mut response, info.stored_size, stream)
+        if served != (0..info.stored_size) {
+            response.insert_header(ContentRange(ContentRangeSpec::Bytes {
+                range: Some((served.start, served.end - 1)),
+                instance_length: Some(info.stored_size),
+            }));
+        }
+        sized(&mut response, served.end - served.start, stream)
     } else {
         response.streaming(compression::decode_stream(stream))
     }))
@@ -169,6 +212,38 @@ where
 {
     response.no_chunking(length);
     response.body(SizedStream::new(length, stream))
+}
+
+enum RangeOutcome {
+    Full,
+    /// Half-open, in bytes of the stored object.
+    Partial(Range<u64>),
+    Unsatisfiable,
+}
+
+/// The single byte range a client asked for, against a representation `len`
+/// bytes long. Anything that can't be honoured — several ranges, another
+/// unit, an unparseable spec, an `If-Range` — is answered with the whole
+/// representation rather than an error; only a well-formed range lying
+/// entirely past the end is unsatisfiable.
+fn requested_range(req: &HttpRequest, len: u64) -> RangeOutcome {
+    let Ok(RangeHeader::Bytes(specs)) = RangeHeader::parse(req) else {
+        return RangeOutcome::Full;
+    };
+    let [spec] = specs.as_slice() else {
+        return RangeOutcome::Full;
+    };
+    // If-Range: the range only makes sense against the copy the client
+    // already holds, identified by a validator matching the one the
+    // representation carries. No validator is sent yet for one to match, so
+    // the client needs the whole thing again (RFC 9110 §13.1.5).
+    if req.headers().contains_key(header::IF_RANGE) {
+        return RangeOutcome::Full;
+    }
+    match spec.to_satisfiable_range(len) {
+        Some((first, last)) => RangeOutcome::Partial(first..last + 1),
+        None => RangeOutcome::Unsatisfiable,
+    }
 }
 
 /// Whether the client asked for gzip. Absence means no: the debuginfod clients
@@ -213,8 +288,8 @@ async fn federated_lookup(
     };
     let head_only = req.method() == Method::HEAD;
 
-    // Cached entries are served exactly like our own symbols: negotiated and
-    // HEAD-able.
+    // Cached entries are served exactly like our own symbols: negotiated,
+    // ranged, HEAD-able.
     if let Some(response) = serve(req, &state.store, Source::Upstream { id }).await? {
         tracing::debug!(build_id = %id, "Serving upstream symbol from cache");
         return Ok(response);
@@ -304,7 +379,7 @@ mod tests {
     use actix_web::{App, test, web};
 
     use crate::api::{AppState, Plane, configure_internal, configure_public};
-    use crate::compression::{Compression, compress};
+    use crate::compression::{Compression, compress, decompress};
     use crate::config::Config;
     use crate::formats::{SymbolFormat, SymbolInfo};
     use crate::storage::{Project, Store, SymbolMeta, Visibility};
@@ -784,5 +859,176 @@ mod tests {
         assert!(head.body.is_empty());
         assert_eq!(head.header("content-length"), gzip.header("content-length"));
         assert_eq!(head.header("content-encoding"), gzip.header("content-encoding"));
+    }
+
+    #[actix_web::test]
+    async fn responses_advertise_whether_they_can_be_ranged() {
+        let state = seeded_state().await;
+
+        let identity = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", false)).await;
+        assert_eq!(identity.status, 200);
+        assert_eq!(identity.body, b"public symbols");
+        assert_eq!(
+            identity.header("accept-ranges").as_deref(),
+            Some("none"),
+            "an inflated response can't be ranged"
+        );
+        assert_eq!(identity.header("vary").as_deref(), Some("accept-encoding"));
+
+        let gzip = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
+        assert_eq!(gzip.status, 200);
+        assert_eq!(gzip.header("accept-ranges").as_deref(), Some("bytes"));
+        assert_eq!(
+            gzip.header("content-length").unwrap().parse::<usize>().unwrap(),
+            gzip.body.len()
+        );
+
+        // A plain object is one representation for everyone.
+        let legacy = send(&state, Plane::Public, debuginfo(Method::GET, "99887766", false)).await;
+        assert_eq!(legacy.header("content-length").as_deref(), Some("14"));
+        assert_eq!(legacy.header("accept-ranges").as_deref(), Some("bytes"));
+    }
+
+    #[actix_web::test]
+    async fn byte_ranges_apply_to_the_bytes_sent_verbatim() {
+        let state = seeded_state().await;
+        let full = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
+        let stored = full.body.clone();
+        let len = stored.len();
+
+        for (range, expected) in [
+            ("bytes=0-3", &stored[0..4]),
+            ("bytes=5-", &stored[5..]),
+            ("bytes=-4", &stored[len - 4..]),
+            // An end past the last byte is clipped, not refused.
+            ("bytes=2-9999", &stored[2..]),
+        ] {
+            let request = debuginfo(Method::GET, "aabbccdd", true).insert_header(("range", range));
+            let reply = send(&state, Plane::Public, request).await;
+            assert_eq!(reply.status, 206, "{range}");
+            assert_eq!(reply.body, expected, "{range}");
+            assert_eq!(reply.header("content-encoding").as_deref(), Some("gzip"), "{range}");
+            assert_eq!(
+                reply.header("content-length").as_deref(),
+                Some(expected.len().to_string().as_str()),
+                "{range}"
+            );
+            assert_eq!(reply.header("accept-ranges").as_deref(), Some("bytes"), "{range}");
+        }
+        let request = debuginfo(Method::GET, "aabbccdd", true).insert_header(("range", "bytes=0-3"));
+        let reply = send(&state, Plane::Public, request).await;
+        assert_eq!(
+            reply.header("content-range").as_deref(),
+            Some(format!("bytes 0-3/{len}").as_str())
+        );
+
+        // Objects stored plain are ranged for every client.
+        let request = debuginfo(Method::GET, "99887766", false).insert_header(("range", "bytes=0-5"));
+        let reply = send(&state, Plane::Public, request).await;
+        assert_eq!(reply.status, 206);
+        assert_eq!(reply.body, b"legacy");
+        assert_eq!(reply.header("content-range").as_deref(), Some("bytes 0-5/14"));
+        assert_eq!(reply.header("content-encoding"), None);
+    }
+
+    #[actix_web::test]
+    async fn ranges_past_the_end_are_unsatisfiable() {
+        let state = seeded_state().await;
+        let len = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true))
+            .await
+            .body
+            .len();
+
+        for range in ["bytes=9999-", "bytes=9999-10000", "bytes=-0"] {
+            let request = debuginfo(Method::GET, "aabbccdd", true).insert_header(("range", range));
+            let reply = send(&state, Plane::Public, request).await;
+            assert_eq!(reply.status, 416, "{range}");
+            assert!(reply.body.is_empty(), "{range}");
+            assert_eq!(
+                reply.header("content-range").as_deref(),
+                Some(format!("bytes */{len}").as_str()),
+                "{range}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn ranges_that_cannot_be_honoured_are_ignored() {
+        let state = seeded_state().await;
+
+        let cases: Vec<(bool, Vec<(&str, &str)>)> = vec![
+            // An inflated response.
+            (false, vec![("range", "bytes=0-3")]),
+            // Several ranges.
+            (true, vec![("range", "bytes=0-1,3-4")]),
+            // Another unit, or nonsense.
+            (true, vec![("range", "items=0-1")]),
+            (true, vec![("range", "bytes=garbage")]),
+            // If-Range naming some version: nothing is sent for it to match.
+            (true, vec![("range", "bytes=0-3"), ("if-range", "\"stale\"")]),
+            (
+                true,
+                vec![("range", "bytes=0-3"), ("if-range", "Sat, 01 Jan 2000 00:00:00 GMT")],
+            ),
+        ];
+        for (gzip, headers) in cases {
+            let mut request = debuginfo(Method::GET, "aabbccdd", gzip);
+            for (name, value) in &headers {
+                request = request.insert_header((*name, *value));
+            }
+            let reply = send(&state, Plane::Public, request).await;
+            assert_eq!(reply.status, 200, "{headers:?}");
+            assert!(reply.header("content-range").is_none(), "{headers:?}");
+            let body = if gzip {
+                decompress(&reply.body, 1 << 20).unwrap().to_vec()
+            } else {
+                reply.body
+            };
+            assert_eq!(body, b"public symbols", "{headers:?}");
+        }
+
+        // A HEAD describes the whole representation, range or no range.
+        let full = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
+        let request = debuginfo(Method::HEAD, "aabbccdd", true).insert_header(("range", "bytes=0-3"));
+        let reply = send(&state, Plane::Public, request).await;
+        assert_eq!(reply.status, 200);
+        assert!(reply.header("content-range").is_none());
+        assert_eq!(reply.header("content-length"), full.header("content-length"));
+        assert_eq!(reply.header("accept-ranges"), full.header("accept-ranges"));
+    }
+
+    #[actix_web::test]
+    async fn cached_upstream_symbols_are_ranged_too() {
+        let state = seeded_state_with(|config| {
+            // Nothing listens here: a cache hit must never consult upstream.
+            config.federation.upstream = Some("http://127.0.0.1:1".to_string());
+        })
+        .await;
+        let data = b"upstream symbols";
+        state
+            .store
+            .put_upstream("cafebabe", compress(data).unwrap())
+            .await
+            .unwrap();
+
+        let gzip = send(&state, Plane::Public, debuginfo(Method::GET, "cafebabe", true)).await;
+        assert_eq!(gzip.status, 200);
+        assert_eq!(gzip.header("content-encoding").as_deref(), Some("gzip"));
+        assert_eq!(gzip.header("accept-ranges").as_deref(), Some("bytes"));
+        assert_eq!(&decompress(&gzip.body, 1 << 20).unwrap()[..], data);
+
+        let request = debuginfo(Method::GET, "cafebabe", true).insert_header(("range", "bytes=0-1"));
+        let part = send(&state, Plane::Public, request).await;
+        assert_eq!(part.status, 206);
+        assert_eq!(part.body, &gzip.body[0..2]);
+        assert_eq!(
+            part.header("content-range").as_deref(),
+            Some(format!("bytes 0-1/{}", gzip.body.len()).as_str())
+        );
+
+        let identity = send(&state, Plane::Public, debuginfo(Method::GET, "cafebabe", false)).await;
+        assert_eq!(identity.status, 200);
+        assert_eq!(identity.body, data);
+        assert_eq!(identity.header("accept-ranges").as_deref(), Some("none"));
     }
 }

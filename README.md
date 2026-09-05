@@ -97,6 +97,26 @@ bucket and the download:
 Objects written before this all get served as they always were; the encoding
 of each is part of its key.
 
+### HTTP semantics
+
+Every `/buildid/{id}/debuginfo` response — a published symbol or a cached
+upstream one — behaves like a static file would:
+
+- **HEAD** returns exactly the headers the GET would (status,
+  `Content-Length`, `Content-Encoding`, ...) with no body, and is answered
+  from object metadata alone; nothing is read from the bucket.
+- **Byte ranges** (a single `Range: bytes=...`) are honoured on the bytes the
+  server sends verbatim — the stored gzip stream for a client that accepts
+  gzip, or a plain object for anyone — and read from storage as a range, so
+  `Content-Range: bytes 0-1023/<stored size>` describes the gzip bytes,
+  exactly as `Content-Encoding: gzip` says it does. An inflated response
+  cannot be ranged without inflating from the start, so it carries
+  `Accept-Ranges: none` and a `Range` on it is ignored (200, the whole
+  file). A range lying past the end is a 416 with `Content-Range: bytes
+  */<size>`; several ranges, other units and an `If-Range` all fall back to
+  the whole representation (there is no validator yet for an `If-Range` to
+  match). A HEAD describes the whole representation, range or no range.
+
 ## Chunked uploads
 
 A single request can only be as large as the smallest hop in front of the
