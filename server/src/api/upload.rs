@@ -657,11 +657,11 @@ mod tests {
         assert_eq!(index.project, "SierraSoftworks/analytics");
         let stored = state
             .store
-            .get_symbol(&index.project, &expected_id)
+            .get_symbol(&index.project, &expected_id, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(stored.info.compression, Compression::Gzip);
         assert_eq!(
             stored.result.bytes().await.unwrap(),
             gzipped,
@@ -691,11 +691,11 @@ mod tests {
         let expected_id = hex::encode(build_id);
         let stored = state
             .store
-            .get_symbol("SierraSoftworks/grey", &expected_id)
+            .get_symbol("SierraSoftworks/grey", &expected_id, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(stored.info.compression, Compression::Gzip);
         let decoded =
             compression::decompress(&stored.result.bytes().await.unwrap(), 1 << 20).unwrap();
         assert_eq!(decoded, elf, "round-trips through the at-rest encoding");
