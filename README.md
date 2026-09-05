@@ -89,8 +89,10 @@ bucket and the download:
 - **Downloading** — a client that advertises `Accept-Encoding: gzip` gets
   those exact bytes back with `Content-Encoding: gzip`; no other client is
   handed anything it didn't ask for, so requests without the header are
-  inflated as they stream out. Either way the server never holds a whole
-  symbol file in memory to serve it.
+  inflated as they stream out (in 256KiB chunks — the inflate path used to
+  hand the HTTP layer 4KiB at a time, and ran at half the speed of the
+  pass-through for it). Either way the server never holds a whole symbol
+  file in memory to serve it.
 
 Objects written before this all get served as they always were; the encoding
 of each is part of its key.
