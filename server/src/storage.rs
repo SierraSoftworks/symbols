@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
-use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload, path::Path};
+use object_store::{
+    Attribute, Attributes, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutOptions,
+    PutPayload, path::Path,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::compression::Compression;
@@ -245,13 +248,23 @@ impl StreamingWriter {
 }
 
 /// What storage knows about an object without reading it: enough to answer
-/// a HEAD or validate a byte range before any body is fetched.
+/// a HEAD, evaluate a conditional request, or validate a byte range before
+/// any body is fetched.
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
     /// Size of the object on disk — the compressed size unless `compression`
     /// is `None`.
     pub stored_size: u64,
     pub compression: Compression,
+    /// The symbol file's own (inflated) size, when the object records it —
+    /// the upstream cache does so in object metadata; published symbols carry
+    /// theirs in `meta.json` instead.
+    pub size: Option<u64>,
+    /// When the object was written.
+    pub last_modified: DateTime<Utc>,
+    /// The store's own validator for the stored bytes (S3's ETag), when it
+    /// has one.
+    pub e_tag: Option<String>,
 }
 
 /// An object as it sits in storage, ready to be streamed to a client either
@@ -264,10 +277,23 @@ pub struct StoredObject {
     pub result: object_store::GetResult,
 }
 
-fn object_info(meta: &object_store::ObjectMeta, compression: Compression) -> ObjectInfo {
+/// Object metadata key recording an upstream cache entry's inflated size.
+const SIZE_ATTRIBUTE: &str = "symbol-size";
+
+fn object_info(
+    meta: &object_store::ObjectMeta,
+    attributes: &Attributes,
+    compression: Compression,
+) -> ObjectInfo {
+    let size = attributes
+        .get(&Attribute::Metadata(SIZE_ATTRIBUTE.into()))
+        .and_then(|v| v.as_ref().parse::<u64>().ok());
     ObjectInfo {
         stored_size: meta.size,
         compression,
+        size,
+        last_modified: meta.last_modified,
+        e_tag: meta.e_tag.clone(),
     }
 }
 
@@ -392,7 +418,7 @@ impl Store {
             let options = GetOptions::new().with_range(range.clone().map(GetRange::Bounded));
             match self.inner.get_opts(&encoded_path(base, compression), options).await {
                 Ok(result) => {
-                    let info = object_info(&result.meta, compression);
+                    let info = object_info(&result.meta, &result.attributes, compression);
                     return Ok(Some(StoredObject {
                         info,
                         range: result.range.clone(),
@@ -412,7 +438,9 @@ impl Store {
         for compression in [Compression::Gzip, Compression::None] {
             let options = GetOptions::new().with_head(true);
             match self.inner.get_opts(&encoded_path(base, compression), options).await {
-                Ok(result) => return Ok(Some(object_info(&result.meta, compression))),
+                Ok(result) => {
+                    return Ok(Some(object_info(&result.meta, &result.attributes, compression)));
+                }
                 Err(object_store::Error::NotFound { .. }) => continue,
                 Err(e) => return Err(e.into()),
             }
@@ -434,6 +462,10 @@ impl Store {
     /// The stored symbol's metadata, without reading it.
     pub async fn head_symbol(&self, project: &str, id: &str) -> Result<Option<ObjectInfo>, Error> {
         self.head_encoded(&symbol_data_base(project, id)).await
+    }
+
+    pub async fn get_symbol_meta(&self, project: &str, id: &str) -> Result<Option<SymbolMeta>, Error> {
+        self.get_json(&symbol_meta_path(project, id)).await
     }
 
     pub async fn list_symbols(&self, project: &str) -> Result<Vec<SymbolMeta>, Error> {
@@ -485,12 +517,22 @@ impl Store {
     }
 
     /// Caches an upstream symbol. `data` is already gzip-encoded, matching how
-    /// our own symbols are stored.
-    pub async fn put_upstream(&self, id: &str, data: bytes::Bytes) -> Result<(), Error> {
+    /// our own symbols are stored; `size` is the symbol file's own length,
+    /// recorded on the object so the inflated response can carry a
+    /// `Content-Length` without a metadata file of its own.
+    pub async fn put_upstream(&self, id: &str, data: bytes::Bytes, size: u64) -> Result<(), Error> {
+        let options = PutOptions {
+            attributes: Attributes::from_iter([(
+                Attribute::Metadata(SIZE_ATTRIBUTE.into()),
+                size.to_string(),
+            )]),
+            ..Default::default()
+        };
         self.inner
-            .put(
+            .put_opts(
                 &encoded_path(&upstream_base(id), Compression::Gzip),
                 PutPayload::from(data),
+                options,
             )
             .await?;
         Ok(())
@@ -774,6 +816,9 @@ mod tests {
         let info = store.head_symbol(project, "abcd1234").await.unwrap().unwrap();
         assert_eq!(info.stored_size, 4);
         assert_eq!(info.compression, Compression::Gzip);
+        assert!(info.e_tag.is_some(), "the store should hand back its validator");
+        let meta = store.get_symbol_meta(project, "abcd1234").await.unwrap().unwrap();
+        assert_eq!(meta.version, "v1.0.0");
         let part = store.get_symbol(project, "abcd1234", Some(1..3)).await.unwrap().unwrap();
         assert_eq!(part.range, 1..3);
         assert_eq!(part.info.stored_size, 4, "the info describes the whole object");
@@ -787,6 +832,7 @@ mod tests {
         assert!(store.get_index("abcd1234").await.unwrap().is_none());
         assert!(store.get_symbol(project, "abcd1234", None).await.unwrap().is_none());
         assert!(store.head_symbol(project, "abcd1234").await.unwrap().is_none());
+        assert!(store.get_symbol_meta(project, "abcd1234").await.unwrap().is_none());
     }
 
     /// Symbols written before the server compressed at rest sit at the
@@ -891,16 +937,18 @@ mod tests {
     async fn upstream_cache_roundtrip() {
         let store = Store::in_memory();
         store
-            .put_upstream("cafebabe", bytes::Bytes::from_static(b"gzipped"))
+            .put_upstream("cafebabe", bytes::Bytes::from_static(b"gzipped"), 1234)
             .await
             .unwrap();
 
         let stored = store.get_upstream("cafebabe", None).await.unwrap().unwrap();
         assert_eq!(stored.info.compression, Compression::Gzip);
+        assert_eq!(stored.info.size, Some(1234), "the inflated size rides on the object");
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"gzipped");
 
         let info = store.head_upstream("cafebabe").await.unwrap().unwrap();
         assert_eq!(info.compression, Compression::Gzip);
+        assert_eq!(info.size, Some(1234));
         assert_eq!(info.stored_size, 7);
         let part = store.get_upstream("cafebabe", Some(0..2)).await.unwrap().unwrap();
         assert_eq!(&part.result.bytes().await.unwrap()[..], b"gz");

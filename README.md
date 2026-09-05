@@ -92,7 +92,10 @@ bucket and the download:
   inflated as they stream out (in 256KiB chunks — the inflate path used to
   hand the HTTP layer 4KiB at a time, and ran at half the speed of the
   pass-through for it). Either way the server never holds a whole symbol
-  file in memory to serve it.
+  file in memory to serve it, and either way the response carries a
+  `Content-Length`: the stored size for the gzip bytes, and the symbol
+  file's own size — recorded in its metadata at upload — for an inflated
+  one.
 
 Objects written before this all get served as they always were; the encoding
 of each is part of its key.
@@ -103,8 +106,8 @@ Every `/buildid/{id}/debuginfo` response — a published symbol or a cached
 upstream one — behaves like a static file would:
 
 - **HEAD** returns exactly the headers the GET would (status,
-  `Content-Length`, `Content-Encoding`, ...) with no body, and is answered
-  from object metadata alone; nothing is read from the bucket.
+  `Content-Length`, `Content-Encoding`, validators, ...) with no body, and
+  is answered from object metadata alone; nothing is read from the bucket.
 - **Byte ranges** (a single `Range: bytes=...`) are honoured on the bytes the
   server sends verbatim — the stored gzip stream for a client that accepts
   gzip, or a plain object for anyone — and read from storage as a range, so
@@ -113,9 +116,22 @@ upstream one — behaves like a static file would:
   cannot be ranged without inflating from the start, so it carries
   `Accept-Ranges: none` and a `Range` on it is ignored (200, the whole
   file). A range lying past the end is a 416 with `Content-Range: bytes
-  */<size>`; several ranges, other units and an `If-Range` all fall back to
-  the whole representation (there is no validator yet for an `If-Range` to
-  match). A HEAD describes the whole representation, range or no range.
+  */<size>`; several ranges, other units and an `If-Range` naming a
+  different version all fall back to the whole representation. A HEAD
+  describes the whole representation, range or no range.
+- **Validators** — `ETag` (the stored object's own strong tag; the inflated
+  representation carries a distinct one) and `Last-Modified`.
+  `If-None-Match` and `If-Modified-Since` are answered with 304, and
+  `If-Range` gates a range on them.
+- **Caching** — `Cache-Control: public, max-age=31536000, immutable`, since
+  the bytes behind a build ID never change, with `Vary: Accept-Encoding`
+  for the two representations. Note that this makes withdrawing a project
+  from the public plane non-retroactive for caches already holding its
+  symbols.
+- **debuginfod headers** — `X-DEBUGINFOD-SIZE` carries the symbol file's
+  size whatever encoding it travels in. `X-DEBUGINFOD-FILE` and
+  `X-DEBUGINFOD-ARCHIVE` are not sent: symbols are stored as bare files, not
+  extracted from archives.
 
 ## Chunked uploads
 
