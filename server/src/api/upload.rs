@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(index.project, "SierraSoftworks/analytics");
         let stored = state
             .store
-            .get_symbol(&index.project, &expected_id)
+            .get_symbol(&index.project, &expected_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -691,7 +691,7 @@ mod tests {
         let expected_id = hex::encode(build_id);
         let stored = state
             .store
-            .get_symbol("SierraSoftworks/grey", &expected_id)
+            .get_symbol("SierraSoftworks/grey", &expected_id, None)
             .await
             .unwrap()
             .unwrap();

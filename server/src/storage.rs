@@ -1,8 +1,9 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
-use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutPayload, path::Path};
+use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::compression::Compression;
@@ -244,7 +245,7 @@ impl StreamingWriter {
 }
 
 /// What storage knows about an object without reading it: enough to answer
-/// a HEAD before any body is fetched.
+/// a HEAD or validate a byte range before any body is fetched.
 #[derive(Debug, Clone)]
 pub struct ObjectInfo {
     /// Size of the object on disk — the compressed size unless `compression`
@@ -257,6 +258,9 @@ pub struct ObjectInfo {
 /// verbatim or through a decoder.
 pub struct StoredObject {
     pub info: ObjectInfo,
+    /// Which bytes of the stored object `result` carries — the whole object
+    /// unless a range was requested.
+    pub range: Range<u64>,
     pub result: object_store::GetResult,
 }
 
@@ -376,13 +380,24 @@ impl Store {
 
     /// Fetches an object by trying each encoding's key in turn. Compressed is
     /// tried first because everything written now is compressed; the plain key
-    /// is the fallback for objects stored before that.
-    async fn get_encoded(&self, base: &str) -> Result<Option<StoredObject>, Error> {
+    /// is the fallback for objects stored before that. With `range`, only
+    /// those bytes of the stored object are read (an S3 range read) — the
+    /// caller validates the range against the object's size first.
+    async fn get_encoded(
+        &self,
+        base: &str,
+        range: Option<Range<u64>>,
+    ) -> Result<Option<StoredObject>, Error> {
         for compression in [Compression::Gzip, Compression::None] {
-            match self.inner.get(&encoded_path(base, compression)).await {
+            let options = GetOptions::new().with_range(range.clone().map(GetRange::Bounded));
+            match self.inner.get_opts(&encoded_path(base, compression), options).await {
                 Ok(result) => {
                     let info = object_info(&result.meta, compression);
-                    return Ok(Some(StoredObject { info, result }));
+                    return Ok(Some(StoredObject {
+                        info,
+                        range: result.range.clone(),
+                        result,
+                    }));
                 }
                 Err(object_store::Error::NotFound { .. }) => continue,
                 Err(e) => return Err(e.into()),
@@ -406,9 +421,14 @@ impl Store {
     }
 
     /// Returns the stored symbol, ready to stream, with the encoding it is
-    /// stored in.
-    pub async fn get_symbol(&self, project: &str, id: &str) -> Result<Option<StoredObject>, Error> {
-        self.get_encoded(&symbol_data_base(project, id)).await
+    /// stored in. `range` selects a slice of the stored bytes.
+    pub async fn get_symbol(
+        &self,
+        project: &str,
+        id: &str,
+        range: Option<Range<u64>>,
+    ) -> Result<Option<StoredObject>, Error> {
+        self.get_encoded(&symbol_data_base(project, id), range).await
     }
 
     /// The stored symbol's metadata, without reading it.
@@ -452,8 +472,12 @@ impl Store {
 
     // --- Upstream federation cache ---------------------------------------
 
-    pub async fn get_upstream(&self, id: &str) -> Result<Option<StoredObject>, Error> {
-        self.get_encoded(&upstream_base(id)).await
+    pub async fn get_upstream(
+        &self,
+        id: &str,
+        range: Option<Range<u64>>,
+    ) -> Result<Option<StoredObject>, Error> {
+        self.get_encoded(&upstream_base(id), range).await
     }
 
     pub async fn head_upstream(&self, id: &str) -> Result<Option<ObjectInfo>, Error> {
@@ -740,15 +764,20 @@ mod tests {
         let index = store.get_index("abcd1234").await.unwrap().unwrap();
         assert_eq!(index.project, project);
 
-        let stored = store.get_symbol(project, "abcd1234").await.unwrap().unwrap();
+        let stored = store.get_symbol(project, "abcd1234", None).await.unwrap().unwrap();
         assert_eq!(stored.info.stored_size, 4);
         assert_eq!(stored.info.compression, Compression::Gzip);
+        assert_eq!(stored.range, 0..4);
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"data");
 
-        // Metadata alone.
+        // Metadata alone, and a slice of the stored bytes.
         let info = store.head_symbol(project, "abcd1234").await.unwrap().unwrap();
         assert_eq!(info.stored_size, 4);
         assert_eq!(info.compression, Compression::Gzip);
+        let part = store.get_symbol(project, "abcd1234", Some(1..3)).await.unwrap().unwrap();
+        assert_eq!(part.range, 1..3);
+        assert_eq!(part.info.stored_size, 4, "the info describes the whole object");
+        assert_eq!(&part.result.bytes().await.unwrap()[..], b"at");
 
         let symbols = store.list_symbols(project).await.unwrap();
         assert_eq!(symbols.len(), 1);
@@ -756,7 +785,7 @@ mod tests {
 
         store.delete_symbol(project, "abcd1234").await.unwrap();
         assert!(store.get_index("abcd1234").await.unwrap().is_none());
-        assert!(store.get_symbol(project, "abcd1234").await.unwrap().is_none());
+        assert!(store.get_symbol(project, "abcd1234", None).await.unwrap().is_none());
         assert!(store.head_symbol(project, "abcd1234").await.unwrap().is_none());
     }
 
@@ -776,12 +805,12 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = store.get_symbol(project, "deadbeef").await.unwrap().unwrap();
+        let stored = store.get_symbol(project, "deadbeef", None).await.unwrap().unwrap();
         assert_eq!(stored.info.compression, Compression::None);
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"data");
 
         store.delete_symbol(project, "deadbeef").await.unwrap();
-        assert!(store.get_symbol(project, "deadbeef").await.unwrap().is_none());
+        assert!(store.get_symbol(project, "deadbeef", None).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -866,13 +895,15 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = store.get_upstream("cafebabe").await.unwrap().unwrap();
+        let stored = store.get_upstream("cafebabe", None).await.unwrap().unwrap();
         assert_eq!(stored.info.compression, Compression::Gzip);
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"gzipped");
 
         let info = store.head_upstream("cafebabe").await.unwrap().unwrap();
         assert_eq!(info.compression, Compression::Gzip);
         assert_eq!(info.stored_size, 7);
+        let part = store.get_upstream("cafebabe", Some(0..2)).await.unwrap().unwrap();
+        assert_eq!(&part.result.bytes().await.unwrap()[..], b"gz");
     }
 
     #[tokio::test]
