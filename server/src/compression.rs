@@ -78,16 +78,31 @@ pub fn decompress(data: &[u8], limit: usize) -> Result<Bytes, Error> {
     Ok(Bytes::from(out))
 }
 
+/// How much inflated output each chunk of a decoded stream carries. The
+/// decoder fills the whole buffer before yielding, so this sets the size of
+/// every body chunk the HTTP layer writes (and every allocation on the way).
+/// `ReaderStream`'s default is 4KiB, which turned a 30MB symbol file into
+/// ~7,500 chunked-transfer frames and per-frame writes — the inflate path ran
+/// at a fraction of the pass-through path's throughput for no CPU reason.
+/// 256KiB per in-flight response is a trivial amount of memory.
+const INFLATE_CHUNK_SIZE: usize = 256 * 1024;
+
 /// Inflates a stored gzip stream on the way out, for clients that can't take
 /// `Content-Encoding: gzip`. Streaming (rather than buffering) keeps the
-/// server's memory flat no matter how large the symbol file is.
+/// server's memory flat no matter how large the symbol file is: the decoder
+/// holds one input chunk and one output buffer, however large the file.
+///
+/// Inflating is CPU work on the async runtime, but bounded per poll by the
+/// output buffer (~a quarter of a millisecond of gzip per chunk), so it
+/// doesn't need `spawn_blocking` — that would only add a channel hop per
+/// chunk.
 pub fn decode_stream(stream: ByteStream) -> ByteStream {
     let reader = tokio_util::io::StreamReader::new(stream);
     let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(reader);
     // Symbol files gzipped by `gzip`/`zlib` are a single member, but nothing
     // stops a client concatenating several; decode them all.
     decoder.multiple_members(true);
-    Box::pin(tokio_util::io::ReaderStream::new(decoder))
+    Box::pin(tokio_util::io::ReaderStream::with_capacity(decoder, INFLATE_CHUNK_SIZE))
 }
 
 #[cfg(test)]
@@ -144,5 +159,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded.concat(), plain);
+    }
+
+    /// The inflated stream must come out in large chunks: each one is a body
+    /// frame and a write on the wire, and 4KiB chunks were the bottleneck.
+    #[actix_web::test]
+    async fn decoded_streams_come_out_in_large_chunks() {
+        // Highly compressible, so the whole thing is a handful of input
+        // chunks but ~1MiB of output.
+        let plain = vec![0u8; 1024 * 1024];
+        let compressed = compress(&plain).unwrap();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = compressed
+            .chunks(1024)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+
+        let decoded: Vec<Bytes> = decode_stream(Box::pin(futures::stream::iter(chunks)))
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(decoded.concat(), plain);
+        let full: Vec<_> = decoded.iter().take(decoded.len() - 1).collect();
+        assert!(!full.is_empty());
+        for chunk in full {
+            assert_eq!(chunk.len(), INFLATE_CHUNK_SIZE, "every chunk but the last fills the buffer");
+        }
     }
 }
