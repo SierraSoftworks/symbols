@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use actix_web::web;
+use actix_web::{guard, web};
 
 use crate::auth::{Sessions, Validator};
 use crate::config::Config;
@@ -63,19 +63,29 @@ impl AppState {
     }
 }
 
+/// A route answering GET and HEAD alike. `web::get()` matches GET only, and
+/// a HEAD that matches no route is a 404 — which had `curl -I`, elfutils'
+/// existence probes and load-balancer health checks reading every symbol as
+/// missing. The debuginfod handler inspects the method itself so a HEAD
+/// never fetches a body; for the rest, actix drops the body on the wire.
+fn read<F, Args>(handler: F) -> actix_web::Route
+where
+    F: actix_web::Handler<Args>,
+    Args: actix_web::FromRequest + 'static,
+    F::Output: actix_web::Responder + 'static,
+{
+    web::route()
+        .guard(guard::Any(guard::Get()).or(guard::Head()))
+        .to(handler)
+}
+
 /// Routes served on both planes: health, the debuginfod read protocol, and
 /// symbol uploads (GitHub's OIDC-authenticated CI runners live on the public
 /// internet).
 fn configure_core(cfg: &mut web::ServiceConfig) {
-    cfg.route("/health", web::get().to(health))
-        .route(
-            "/buildid/{id}/debuginfo",
-            web::get().to(debuginfod::get_debuginfo),
-        )
-        .route(
-            "/buildid/{id}/{section}",
-            web::get().to(debuginfod::unsupported),
-        )
+    cfg.route("/health", read(health))
+        .route("/buildid/{id}/debuginfo", read(debuginfod::get_debuginfo))
+        .route("/buildid/{id}/{section}", read(debuginfod::unsupported))
         .route("/api/v1/symbols", web::post().to(upload::upload_symbol))
         // Chunked uploads, for symbol files too large for one request to
         // carry through the CDN in front of the public plane.
@@ -148,8 +158,8 @@ pub fn configure_internal(cfg: &mut web::ServiceConfig) {
         .route("/auth/callback", web::get().to(oidc::callback))
         .route("/auth/logout", web::get().to(oidc::logout))
         // Static assets, embedded in the binary.
-        .route("/static/styles.css", web::get().to(assets::stylesheet))
-        .route("/static/app.js", web::get().to(assets::script));
+        .route("/static/styles.css", read(assets::stylesheet))
+        .route("/static/app.js", read(assets::script));
 }
 
 async fn health(state: web::Data<Arc<AppState>>) -> actix_web::HttpResponse {
