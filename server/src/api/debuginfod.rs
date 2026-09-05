@@ -1,11 +1,16 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use actix_web::body::{self, SizedStream};
-use actix_web::http::header::{self, ContentRange, ContentRangeSpec, Header, Range as RangeHeader};
+use actix_web::http::header::{
+    self, ContentRange, ContentRangeSpec, ETag, EntityTag, Header, HttpDate, IfModifiedSince,
+    IfNoneMatch, IfRange, LastModified, Range as RangeHeader,
+};
 use actix_web::http::{Method, StatusCode};
 use actix_web::{HttpRequest, HttpResponse, HttpResponseBuilder, web};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
 
 use super::{AppState, Plane};
@@ -13,6 +18,12 @@ use crate::compression::{self, ByteStream, Compression};
 use crate::errors::Error;
 use crate::formats::sanitize_id;
 use crate::storage::{ObjectInfo, Store, StoredObject, Visibility};
+
+/// Symbols are addressed by build ID and the bytes behind one never change,
+/// so any cache may keep a response for as long as it likes. (Withdrawing a
+/// project from the public plane is not retroactive for caches that already
+/// hold its symbols — the same is true of any CDN in front of the server.)
+const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 /// `GET`/`HEAD /buildid/{id}/debuginfo` — the debuginfod lookup protocol, as
 /// spoken by Pyroscope's symbolizer, elfutils tooling (`DEBUGINFOD_URLS`),
@@ -35,11 +46,18 @@ pub async fn get_debuginfo(
             _ => false,
         };
         if visible {
+            // The symbol's metadata records the file's own size, which is
+            // what an inflated response's Content-Length reports.
+            let size = state
+                .store
+                .get_symbol_meta(&index.project, &id)
+                .await?
+                .map(|meta| meta.size);
             let source = Source::Symbol {
                 project: &index.project,
                 id: &id,
             };
-            if let Some(response) = serve(&req, &state.store, source).await? {
+            if let Some(response) = serve(&req, &state.store, source, size).await? {
                 tracing::debug!(build_id = %id, project = %index.project, "Serving stored symbol");
                 return Ok(response);
             }
@@ -60,7 +78,7 @@ pub async fn unsupported() -> HttpResponse {
 
 /// Where a served object lives. Locally published symbols and the federated
 /// upstream cache are stored the same way, so one response path — content
-/// negotiation, HEAD, byte ranges — covers both.
+/// negotiation, HEAD, byte ranges, conditional requests — covers both.
 #[derive(Clone, Copy)]
 enum Source<'a> {
     Symbol { project: &'a str, id: &'a str },
@@ -68,6 +86,12 @@ enum Source<'a> {
 }
 
 impl Source<'_> {
+    fn id(&self) -> &str {
+        match self {
+            Source::Symbol { id, .. } | Source::Upstream { id } => id,
+        }
+    }
+
     async fn head(&self, store: &Store) -> Result<Option<ObjectInfo>, Error> {
         match *self {
             Source::Symbol { project, id } => store.head_symbol(project, id).await,
@@ -88,7 +112,8 @@ impl Source<'_> {
 }
 
 /// Answers a GET or HEAD for a stored object, or `None` when there is no such
-/// object.
+/// object. `size` is the symbol file's inflated length when the caller knows
+/// it; what the object itself records is the fallback.
 ///
 /// Symbols are held gzipped. A client that advertises gzip gets those bytes
 /// untouched — no inflation here, no re-compression at the edge, and a
@@ -99,12 +124,16 @@ async fn serve(
     req: &HttpRequest,
     store: &Store,
     source: Source<'_>,
+    size: Option<u64>,
 ) -> Result<Option<HttpResponse>, Error> {
     let head_only = req.method() == Method::HEAD;
-    // Anything that may end without a body — a HEAD, a 416 — or with a slice
-    // of it is decided on the object's metadata alone, so no body is fetched
-    // only to be dropped. A plain GET goes straight for the object.
-    let metadata_first = head_only || req.headers().contains_key(header::RANGE);
+    // Anything that may end without a body — a HEAD, a 304, a 416 or a range
+    // — is decided on the object's metadata alone, so no body is fetched only
+    // to be dropped. A plain GET goes straight for the object.
+    let metadata_first = head_only
+        || [header::RANGE, header::IF_NONE_MATCH, header::IF_MODIFIED_SINCE]
+            .iter()
+            .any(|name| req.headers().contains_key(name));
 
     let (info, object) = if metadata_first {
         match source.head(store).await? {
@@ -122,13 +151,23 @@ async fn serve(
     // Whether the stored bytes go out as they are (a gzip client, or a plain
     // object), as opposed to inflated on the way past.
     let verbatim = gzip || info.compression == Compression::None;
+    let size = size
+        .or(info.size)
+        .or((info.compression == Compression::None).then_some(info.stored_size));
+    let validators = Validators::new(&info, source.id(), verbatim);
+
+    if validators.not_modified(req) {
+        let mut response = HttpResponse::build(StatusCode::NOT_MODIFIED);
+        validators.apply(&mut response);
+        return Ok(Some(response.body(body::None::new())));
+    }
 
     // Byte ranges apply to the bytes we send untouched — the stored object,
     // which storage reads as a range — never to an inflated response: a range
     // of *that* representation could only be served by inflating from the
     // start. There, `Accept-Ranges: none` says so and any Range is ignored.
     let range = if verbatim && !head_only {
-        requested_range(req, info.stored_size)
+        requested_range(req, &validators, info.stored_size)
     } else {
         RangeOutcome::Full
     };
@@ -139,10 +178,13 @@ async fn serve(
         RangeOutcome::Unsatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
     });
     response.content_type("application/octet-stream");
-    // What comes back depends on what the client accepts, and there are caches
-    // (a CDN, at least) between us and it.
-    response.insert_header((header::VARY, "accept-encoding"));
+    validators.apply(&mut response);
     response.insert_header((header::ACCEPT_RANGES, if verbatim { "bytes" } else { "none" }));
+    if let Some(size) = size {
+        // The debuginfod protocol's own size header: always the symbol
+        // file's size, whatever encoding it travels in.
+        response.insert_header(("x-debuginfod-size", size));
+    }
     if gzip {
         response.insert_header((header::CONTENT_ENCODING, "gzip"));
     }
@@ -160,13 +202,11 @@ async fn serve(
     };
 
     if head_only {
-        // The length the GET would carry, and no body. The inflated length
-        // isn't known without reading the whole object, so an inflated GET
-        // goes out chunked and its HEAD carries no length either.
-        return Ok(Some(if verbatim {
-            sized(&mut response, info.stored_size, empty_body())
-        } else {
-            response.body(body::None::new())
+        // The length the GET would carry, and no body.
+        let length = if verbatim { Some(info.stored_size) } else { size };
+        return Ok(Some(match length {
+            Some(length) => sized(&mut response, length, empty_body()),
+            None => response.body(body::None::new()),
         }));
     }
 
@@ -194,7 +234,13 @@ async fn serve(
         }
         sized(&mut response, served.end - served.start, stream)
     } else {
-        response.streaming(compression::decode_stream(stream))
+        let inflated = compression::decode_stream(stream);
+        match size {
+            Some(size) => sized(&mut response, size, inflated),
+            // The inflated length isn't recorded for this object (an upstream
+            // cache entry from before it was), so this goes out chunked.
+            None => response.streaming(inflated),
+        }
     }))
 }
 
@@ -204,14 +250,86 @@ fn empty_body() -> futures::stream::Empty<Result<Bytes, std::io::Error>> {
 
 /// A body of known length: `Content-Length` rather than chunked framing —
 /// which is also what lets a HEAD report the length with no body at all.
-/// (A `Content-Length` header set beside a `streaming` body is dropped by
-/// actix in favour of chunking, so this is the only way to send one.)
 fn sized<S>(response: &mut HttpResponseBuilder, length: u64, stream: S) -> HttpResponse
 where
     S: futures::Stream<Item = Result<Bytes, std::io::Error>> + 'static,
 {
     response.no_chunking(length);
     response.body(SizedStream::new(length, stream))
+}
+
+/// The validators a response carries and conditional requests are judged
+/// against. The ETag is the store's own (S3 derives it from the object's
+/// content, so it is a strong validator of the stored bytes and survives a
+/// re-upload of the same build ID only if the bytes are the same); an
+/// inflated response is a different representation and carries a distinct
+/// tag. Without a store ETag, the build ID and write time stand in.
+struct Validators {
+    etag: EntityTag,
+    /// Truncated to the second, which is all an HTTP date carries — so the
+    /// date sent out compares equal to the same date coming back.
+    last_modified: DateTime<Utc>,
+}
+
+impl Validators {
+    fn new(info: &ObjectInfo, id: &str, verbatim: bool) -> Self {
+        let stored = info
+            .e_tag
+            .as_deref()
+            .map(|tag| {
+                tag.trim_start_matches("W/")
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic() && *c != '"')
+                    .collect::<String>()
+            })
+            .filter(|tag| !tag.is_empty())
+            .unwrap_or_else(|| format!("{id}-{}", info.last_modified.timestamp()));
+        let tag = if verbatim {
+            stored
+        } else {
+            format!("{stored}-identity")
+        };
+        let last_modified = DateTime::from_timestamp(info.last_modified.timestamp(), 0)
+            .unwrap_or(info.last_modified);
+        Self {
+            etag: EntityTag::new_strong(tag),
+            last_modified,
+        }
+    }
+
+    fn http_date(&self) -> HttpDate {
+        HttpDate::from(SystemTime::from(self.last_modified))
+    }
+
+    /// The headers every response about this object carries, 304s included.
+    fn apply(&self, response: &mut HttpResponseBuilder) {
+        response
+            // What comes back depends on what the client accepts, and there
+            // are caches (a CDN, at least) between us and it.
+            .insert_header((header::VARY, "accept-encoding"))
+            .insert_header((header::CACHE_CONTROL, CACHE_CONTROL))
+            .insert_header(ETag(self.etag.clone()))
+            .insert_header(LastModified(self.http_date()));
+    }
+
+    /// Whether the client's copy is current. `If-None-Match` wins when both
+    /// it and `If-Modified-Since` are present (RFC 9110 §13.1.3).
+    fn not_modified(&self, req: &HttpRequest) -> bool {
+        // An absent header parses as an empty list, which is no condition.
+        match IfNoneMatch::parse(req) {
+            Ok(IfNoneMatch::Any) => return true,
+            Ok(IfNoneMatch::Items(tags)) if !tags.is_empty() => {
+                return tags.iter().any(|tag| tag.weak_eq(&self.etag));
+            }
+            _ => {}
+        }
+        match IfModifiedSince::parse(req) {
+            Ok(IfModifiedSince(since)) => {
+                SystemTime::from(self.last_modified) <= SystemTime::from(since)
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 enum RangeOutcome {
@@ -223,10 +341,10 @@ enum RangeOutcome {
 
 /// The single byte range a client asked for, against a representation `len`
 /// bytes long. Anything that can't be honoured — several ranges, another
-/// unit, an unparseable spec, an `If-Range` — is answered with the whole
-/// representation rather than an error; only a well-formed range lying
-/// entirely past the end is unsatisfiable.
-fn requested_range(req: &HttpRequest, len: u64) -> RangeOutcome {
+/// unit, an unparseable spec, an `If-Range` naming a different version — is
+/// answered with the whole representation rather than an error; only a
+/// well-formed range lying entirely past the end is unsatisfiable.
+fn requested_range(req: &HttpRequest, validators: &Validators, len: u64) -> RangeOutcome {
     let Ok(RangeHeader::Bytes(specs)) = RangeHeader::parse(req) else {
         return RangeOutcome::Full;
     };
@@ -234,11 +352,18 @@ fn requested_range(req: &HttpRequest, len: u64) -> RangeOutcome {
         return RangeOutcome::Full;
     };
     // If-Range: the range only makes sense against the copy the client
-    // already holds, identified by a validator matching the one the
-    // representation carries. No validator is sent yet for one to match, so
-    // the client needs the whole thing again (RFC 9110 §13.1.5).
-    if req.headers().contains_key(header::IF_RANGE) {
-        return RangeOutcome::Full;
+    // already holds, identified by a strong ETag match or the exact
+    // Last-Modified; otherwise it needs the whole thing again.
+    match IfRange::parse(req) {
+        Ok(IfRange::EntityTag(tag)) if !tag.strong_eq(&validators.etag) => {
+            return RangeOutcome::Full;
+        }
+        Ok(IfRange::Date(date))
+            if SystemTime::from(date) != SystemTime::from(validators.last_modified) =>
+        {
+            return RangeOutcome::Full;
+        }
+        _ => {}
     }
     match spec.to_satisfiable_range(len) {
         Some((first, last)) => RangeOutcome::Partial(first..last + 1),
@@ -289,8 +414,8 @@ async fn federated_lookup(
     let head_only = req.method() == Method::HEAD;
 
     // Cached entries are served exactly like our own symbols: negotiated,
-    // ranged, HEAD-able.
-    if let Some(response) = serve(req, &state.store, Source::Upstream { id }).await? {
+    // ranged, conditional, HEAD-able.
+    if let Some(response) = serve(req, &state.store, Source::Upstream { id }, None).await? {
         tracing::debug!(build_id = %id, "Serving upstream symbol from cache");
         return Ok(response);
     }
@@ -350,10 +475,18 @@ async fn federated_lookup(
             let stored_size = compressed.len();
             // Cache writes are best-effort: the caller still gets their symbols
             // during a storage outage.
-            if let Err(e) = state.store.put_upstream(id, compressed).await {
+            if let Err(e) = state.store.put_upstream(id, compressed, size).await {
                 tracing::warn!(build_id = %id, error = %e, "Failed to cache upstream symbol");
             } else {
                 tracing::info!(build_id = %id, size, stored_size, "Cached upstream symbol");
+                // Now that it is stored, the cache path answers this request
+                // too — same headers and semantics as every later one, at the
+                // cost of reading back what was just written.
+                if let Some(response) =
+                    serve(req, &state.store, Source::Upstream { id }, Some(size)).await?
+                {
+                    return Ok(response);
+                }
             }
         }
         Ok(Err(e)) => {
@@ -362,8 +495,12 @@ async fn federated_lookup(
         Err(e) => tracing::warn!(build_id = %id, error = %e, "Compression task failed"),
     }
 
+    // Not cached (or not readable back yet): the bytes in hand, as they came.
     let mut response = HttpResponse::Ok();
-    response.content_type("application/octet-stream");
+    response
+        .content_type("application/octet-stream")
+        .insert_header((header::CACHE_CONTROL, CACHE_CONTROL))
+        .insert_header(("x-debuginfod-size", size));
     Ok(if head_only {
         sized(&mut response, size, empty_body())
     } else {
@@ -792,7 +929,6 @@ mod tests {
         assert!(body.contains("not permitted"), "unexpected body: {body}");
     }
 
-
     #[actix_web::test]
     async fn head_carries_the_headers_a_get_would_and_no_body() {
         let state = seeded_state().await;
@@ -801,25 +937,25 @@ mod tests {
             let head = send(&state, Plane::Public, debuginfo(Method::HEAD, "aabbccdd", gzip)).await;
             assert_eq!(head.status, 200, "gzip: {gzip}");
             assert!(head.body.is_empty(), "gzip: {gzip}");
-            for name in ["content-length", "content-type", "content-encoding", "vary"] {
+            for name in [
+                "content-length",
+                "content-type",
+                "content-encoding",
+                "etag",
+                "last-modified",
+                "cache-control",
+                "accept-ranges",
+                "vary",
+                "x-debuginfod-size",
+            ] {
                 assert_eq!(head.header(name), get.header(name), "{name} (gzip: {gzip})");
             }
-            if gzip {
-                assert_eq!(
-                    get.header("content-length").unwrap().parse::<usize>().unwrap(),
-                    get.body.len()
-                );
-            } else {
-                // Inflated on the way out: the length isn't known up front.
-                assert_eq!(get.header("content-length"), None);
-            }
+            assert_eq!(
+                get.header("content-length").unwrap().parse::<usize>().unwrap(),
+                get.body.len(),
+                "gzip: {gzip}"
+            );
         }
-
-        // A plain object is one representation for everyone, with its length.
-        let head = send(&state, Plane::Public, debuginfo(Method::HEAD, "99887766", false)).await;
-        assert_eq!(head.status, 200);
-        assert_eq!(head.header("content-length").as_deref(), Some("14"));
-        assert!(head.body.is_empty());
 
         // Absent, hidden and unsupported look the same to HEAD as to GET.
         let hidden = send(&state, Plane::Public, debuginfo(Method::HEAD, "11223344", false)).await;
@@ -837,55 +973,50 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn cached_upstream_symbols_answer_head() {
-        let state = seeded_state_with(|config| {
-            // Nothing listens here: a cache hit must never consult upstream.
-            config.federation.upstream = Some("http://127.0.0.1:1".to_string());
-        })
-        .await;
-        let data = b"upstream symbols";
-        state
-            .store
-            .put_upstream("cafebabe", compress(data).unwrap())
-            .await
-            .unwrap();
-
-        let gzip = send(&state, Plane::Public, debuginfo(Method::GET, "cafebabe", true)).await;
-        assert_eq!(gzip.status, 200);
-        assert_eq!(gzip.header("content-encoding").as_deref(), Some("gzip"));
-
-        let head = send(&state, Plane::Public, debuginfo(Method::HEAD, "cafebabe", true)).await;
-        assert_eq!(head.status, 200);
-        assert!(head.body.is_empty());
-        assert_eq!(head.header("content-length"), gzip.header("content-length"));
-        assert_eq!(head.header("content-encoding"), gzip.header("content-encoding"));
-    }
-
-    #[actix_web::test]
-    async fn responses_advertise_whether_they_can_be_ranged() {
+    async fn responses_describe_the_symbol_file_and_its_representation() {
         let state = seeded_state().await;
 
         let identity = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", false)).await;
         assert_eq!(identity.status, 200);
         assert_eq!(identity.body, b"public symbols");
+        // Inflated on the way out, but the length is known from the metadata.
+        assert_eq!(identity.header("content-length").as_deref(), Some("14"));
+        assert_eq!(identity.header("x-debuginfod-size").as_deref(), Some("14"));
         assert_eq!(
             identity.header("accept-ranges").as_deref(),
             Some("none"),
             "an inflated response can't be ranged"
         );
+        assert_eq!(
+            identity.header("cache-control").as_deref(),
+            Some("public, max-age=31536000, immutable")
+        );
         assert_eq!(identity.header("vary").as_deref(), Some("accept-encoding"));
+        assert!(identity.header("etag").unwrap().starts_with('"'), "a strong validator");
+        assert!(identity.header("last-modified").is_some());
 
         let gzip = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
         assert_eq!(gzip.status, 200);
-        assert_eq!(gzip.header("accept-ranges").as_deref(), Some("bytes"));
+        assert_eq!(
+            gzip.header("x-debuginfod-size").as_deref(),
+            Some("14"),
+            "the protocol's size header is the file's, whatever the encoding"
+        );
         assert_eq!(
             gzip.header("content-length").unwrap().parse::<usize>().unwrap(),
             gzip.body.len()
+        );
+        assert_eq!(gzip.header("accept-ranges").as_deref(), Some("bytes"));
+        assert_ne!(
+            gzip.header("etag"),
+            identity.header("etag"),
+            "distinct representations carry distinct validators"
         );
 
         // A plain object is one representation for everyone.
         let legacy = send(&state, Plane::Public, debuginfo(Method::GET, "99887766", false)).await;
         assert_eq!(legacy.header("content-length").as_deref(), Some("14"));
+        assert_eq!(legacy.header("x-debuginfod-size").as_deref(), Some("14"));
         assert_eq!(legacy.header("accept-ranges").as_deref(), Some("bytes"));
     }
 
@@ -914,6 +1045,7 @@ mod tests {
                 "{range}"
             );
             assert_eq!(reply.header("accept-ranges").as_deref(), Some("bytes"), "{range}");
+            assert_eq!(reply.header("etag"), full.header("etag"), "{range}");
         }
         let request = debuginfo(Method::GET, "aabbccdd", true).insert_header(("range", "bytes=0-3"));
         let reply = send(&state, Plane::Public, request).await;
@@ -955,6 +1087,9 @@ mod tests {
     #[actix_web::test]
     async fn ranges_that_cannot_be_honoured_are_ignored() {
         let state = seeded_state().await;
+        let full = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
+        let etag = full.header("etag").unwrap();
+        let last_modified = full.header("last-modified").unwrap();
 
         let cases: Vec<(bool, Vec<(&str, &str)>)> = vec![
             // An inflated response.
@@ -964,7 +1099,7 @@ mod tests {
             // Another unit, or nonsense.
             (true, vec![("range", "items=0-1")]),
             (true, vec![("range", "bytes=garbage")]),
-            // If-Range naming some version: nothing is sent for it to match.
+            // If-Range naming some other version.
             (true, vec![("range", "bytes=0-3"), ("if-range", "\"stale\"")]),
             (
                 true,
@@ -987,18 +1122,94 @@ mod tests {
             assert_eq!(body, b"public symbols", "{headers:?}");
         }
 
+        // ...whereas an If-Range naming the current version is honoured,
+        // by tag or by date.
+        for value in [etag.as_str(), last_modified.as_str()] {
+            let request = debuginfo(Method::GET, "aabbccdd", true)
+                .insert_header(("range", "bytes=0-3"))
+                .insert_header(("if-range", value));
+            let reply = send(&state, Plane::Public, request).await;
+            assert_eq!(reply.status, 206, "if-range: {value}");
+        }
+
         // A HEAD describes the whole representation, range or no range.
-        let full = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
         let request = debuginfo(Method::HEAD, "aabbccdd", true).insert_header(("range", "bytes=0-3"));
         let reply = send(&state, Plane::Public, request).await;
         assert_eq!(reply.status, 200);
-        assert!(reply.header("content-range").is_none());
         assert_eq!(reply.header("content-length"), full.header("content-length"));
-        assert_eq!(reply.header("accept-ranges"), full.header("accept-ranges"));
     }
 
     #[actix_web::test]
-    async fn cached_upstream_symbols_are_ranged_too() {
+    async fn conditional_requests_are_answered_with_304() {
+        let state = seeded_state().await;
+        for gzip in [false, true] {
+            let full = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", gzip)).await;
+            let etag = full.header("etag").unwrap();
+            let last_modified = full.header("last-modified").unwrap();
+
+            /// Sends a conditional GET and reports whether it came back 304;
+            /// a 304 must carry the validators and caching headers of the 200.
+            async fn not_modified(
+                state: &Arc<AppState>,
+                gzip: bool,
+                full: &Reply,
+                headers: Vec<(&'static str, String)>,
+            ) -> bool {
+                let mut request = debuginfo(Method::GET, "aabbccdd", gzip);
+                for (name, value) in headers {
+                    request = request.insert_header((name, value));
+                }
+                let reply = send(state, Plane::Public, request).await;
+                if reply.status == 304 {
+                    assert!(reply.body.is_empty());
+                    assert_eq!(reply.header("etag"), full.header("etag"));
+                    assert_eq!(reply.header("cache-control"), full.header("cache-control"));
+                    assert_eq!(reply.header("vary"), full.header("vary"));
+                } else {
+                    assert_eq!(reply.status, 200);
+                }
+                reply.status == 304
+            }
+
+            // The tag itself, in a list, weakened, or `*`.
+            for value in [
+                etag.clone(),
+                format!("\"other\", {etag}"),
+                format!("W/{etag}"),
+                "*".to_string(),
+            ] {
+                assert!(
+                    not_modified(&state, gzip, &full, vec![("if-none-match", value.clone())]).await,
+                    "{value}"
+                );
+            }
+            let other = || ("if-none-match", "\"other\"".to_string());
+            assert!(!not_modified(&state, gzip, &full, vec![other()]).await);
+
+            // By date.
+            let since = |value: &str| ("if-modified-since", value.to_string());
+            assert!(not_modified(&state, gzip, &full, vec![since(&last_modified)]).await);
+            assert!(
+                !not_modified(&state, gzip, &full, vec![since("Sat, 01 Jan 2000 00:00:00 GMT")])
+                    .await
+            );
+            // If-None-Match decides when both are present.
+            assert!(!not_modified(&state, gzip, &full, vec![other(), since(&last_modified)]).await);
+
+            // A HEAD is conditional in the same way.
+            let request = debuginfo(Method::HEAD, "aabbccdd", gzip).insert_header(("if-none-match", etag));
+            assert_eq!(send(&state, Plane::Public, request).await.status, 304);
+        }
+
+        // One representation's tag says nothing about the other.
+        let identity = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", false)).await;
+        let request = debuginfo(Method::GET, "aabbccdd", true)
+            .insert_header(("if-none-match", identity.header("etag").unwrap()));
+        assert_eq!(send(&state, Plane::Public, request).await.status, 200);
+    }
+
+    #[actix_web::test]
+    async fn cached_upstream_symbols_are_served_the_same_way() {
         let state = seeded_state_with(|config| {
             // Nothing listens here: a cache hit must never consult upstream.
             config.federation.upstream = Some("http://127.0.0.1:1".to_string());
@@ -1007,15 +1218,31 @@ mod tests {
         let data = b"upstream symbols";
         state
             .store
-            .put_upstream("cafebabe", compress(data).unwrap())
+            .put_upstream("cafebabe", compress(data).unwrap(), data.len() as u64)
             .await
             .unwrap();
+
+        let identity = send(&state, Plane::Public, debuginfo(Method::GET, "cafebabe", false)).await;
+        assert_eq!(identity.status, 200);
+        assert_eq!(identity.body, data);
+        assert_eq!(identity.header("content-length").as_deref(), Some("16"));
+        assert_eq!(identity.header("x-debuginfod-size").as_deref(), Some("16"));
+        assert_eq!(identity.header("accept-ranges").as_deref(), Some("none"));
+        assert_eq!(
+            identity.header("cache-control").as_deref(),
+            Some("public, max-age=31536000, immutable")
+        );
 
         let gzip = send(&state, Plane::Public, debuginfo(Method::GET, "cafebabe", true)).await;
         assert_eq!(gzip.status, 200);
         assert_eq!(gzip.header("content-encoding").as_deref(), Some("gzip"));
-        assert_eq!(gzip.header("accept-ranges").as_deref(), Some("bytes"));
         assert_eq!(&decompress(&gzip.body, 1 << 20).unwrap()[..], data);
+
+        let head = send(&state, Plane::Public, debuginfo(Method::HEAD, "cafebabe", true)).await;
+        assert_eq!(head.status, 200);
+        assert!(head.body.is_empty());
+        assert_eq!(head.header("content-length"), gzip.header("content-length"));
+        assert_eq!(head.header("etag"), gzip.header("etag"));
 
         let request = debuginfo(Method::GET, "cafebabe", true).insert_header(("range", "bytes=0-1"));
         let part = send(&state, Plane::Public, request).await;
@@ -1026,9 +1253,12 @@ mod tests {
             Some(format!("bytes 0-1/{}", gzip.body.len()).as_str())
         );
 
-        let identity = send(&state, Plane::Public, debuginfo(Method::GET, "cafebabe", false)).await;
-        assert_eq!(identity.status, 200);
-        assert_eq!(identity.body, data);
-        assert_eq!(identity.header("accept-ranges").as_deref(), Some("none"));
+        let request = debuginfo(Method::GET, "cafebabe", true)
+            .insert_header(("if-none-match", gzip.header("etag").unwrap()));
+        assert_eq!(send(&state, Plane::Public, request).await.status, 304);
+
+        // The cache is plane-independent, like the upstream it fronts.
+        let internal = send(&state, Plane::Internal, debuginfo(Method::GET, "cafebabe", false)).await;
+        assert_eq!(internal.status, 200);
     }
 }
