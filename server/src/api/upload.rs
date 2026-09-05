@@ -661,7 +661,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(stored.info.compression, Compression::Gzip);
         assert_eq!(
             stored.result.bytes().await.unwrap(),
             gzipped,
@@ -695,7 +695,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(stored.info.compression, Compression::Gzip);
         let decoded =
             compression::decompress(&stored.result.bytes().await.unwrap(), 1 << 20).unwrap();
         assert_eq!(decoded, elf, "round-trips through the at-rest encoding");

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::compression::Compression;
@@ -243,14 +243,28 @@ impl StreamingWriter {
     }
 }
 
-/// An object as it sits in storage, ready to be streamed to a client either
-/// verbatim or through a decoder.
-pub struct StoredObject {
+/// What storage knows about an object without reading it: enough to answer
+/// a HEAD before any body is fetched.
+#[derive(Debug, Clone)]
+pub struct ObjectInfo {
     /// Size of the object on disk — the compressed size unless `compression`
     /// is `None`.
     pub stored_size: u64,
     pub compression: Compression,
+}
+
+/// An object as it sits in storage, ready to be streamed to a client either
+/// verbatim or through a decoder.
+pub struct StoredObject {
+    pub info: ObjectInfo,
     pub result: object_store::GetResult,
+}
+
+fn object_info(meta: &object_store::ObjectMeta, compression: Compression) -> ObjectInfo {
+    ObjectInfo {
+        stored_size: meta.size,
+        compression,
+    }
 }
 
 impl Store {
@@ -367,12 +381,23 @@ impl Store {
         for compression in [Compression::Gzip, Compression::None] {
             match self.inner.get(&encoded_path(base, compression)).await {
                 Ok(result) => {
-                    return Ok(Some(StoredObject {
-                        stored_size: result.meta.size,
-                        compression,
-                        result,
-                    }));
+                    let info = object_info(&result.meta, compression);
+                    return Ok(Some(StoredObject { info, result }));
                 }
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Like [`get_encoded`](Self::get_encoded), but reads only the object's
+    /// metadata — no body is transferred.
+    async fn head_encoded(&self, base: &str) -> Result<Option<ObjectInfo>, Error> {
+        for compression in [Compression::Gzip, Compression::None] {
+            let options = GetOptions::new().with_head(true);
+            match self.inner.get_opts(&encoded_path(base, compression), options).await {
+                Ok(result) => return Ok(Some(object_info(&result.meta, compression))),
                 Err(object_store::Error::NotFound { .. }) => continue,
                 Err(e) => return Err(e.into()),
             }
@@ -384,6 +409,11 @@ impl Store {
     /// stored in.
     pub async fn get_symbol(&self, project: &str, id: &str) -> Result<Option<StoredObject>, Error> {
         self.get_encoded(&symbol_data_base(project, id)).await
+    }
+
+    /// The stored symbol's metadata, without reading it.
+    pub async fn head_symbol(&self, project: &str, id: &str) -> Result<Option<ObjectInfo>, Error> {
+        self.head_encoded(&symbol_data_base(project, id)).await
     }
 
     pub async fn list_symbols(&self, project: &str) -> Result<Vec<SymbolMeta>, Error> {
@@ -424,6 +454,10 @@ impl Store {
 
     pub async fn get_upstream(&self, id: &str) -> Result<Option<StoredObject>, Error> {
         self.get_encoded(&upstream_base(id)).await
+    }
+
+    pub async fn head_upstream(&self, id: &str) -> Result<Option<ObjectInfo>, Error> {
+        self.head_encoded(&upstream_base(id)).await
     }
 
     /// Caches an upstream symbol. `data` is already gzip-encoded, matching how
@@ -707,9 +741,14 @@ mod tests {
         assert_eq!(index.project, project);
 
         let stored = store.get_symbol(project, "abcd1234").await.unwrap().unwrap();
-        assert_eq!(stored.stored_size, 4);
-        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(stored.info.stored_size, 4);
+        assert_eq!(stored.info.compression, Compression::Gzip);
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"data");
+
+        // Metadata alone.
+        let info = store.head_symbol(project, "abcd1234").await.unwrap().unwrap();
+        assert_eq!(info.stored_size, 4);
+        assert_eq!(info.compression, Compression::Gzip);
 
         let symbols = store.list_symbols(project).await.unwrap();
         assert_eq!(symbols.len(), 1);
@@ -718,6 +757,7 @@ mod tests {
         store.delete_symbol(project, "abcd1234").await.unwrap();
         assert!(store.get_index("abcd1234").await.unwrap().is_none());
         assert!(store.get_symbol(project, "abcd1234").await.unwrap().is_none());
+        assert!(store.head_symbol(project, "abcd1234").await.unwrap().is_none());
     }
 
     /// Symbols written before the server compressed at rest sit at the
@@ -737,7 +777,7 @@ mod tests {
             .unwrap();
 
         let stored = store.get_symbol(project, "deadbeef").await.unwrap().unwrap();
-        assert_eq!(stored.compression, Compression::None);
+        assert_eq!(stored.info.compression, Compression::None);
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"data");
 
         store.delete_symbol(project, "deadbeef").await.unwrap();
@@ -827,8 +867,12 @@ mod tests {
             .unwrap();
 
         let stored = store.get_upstream("cafebabe").await.unwrap().unwrap();
-        assert_eq!(stored.compression, Compression::Gzip);
+        assert_eq!(stored.info.compression, Compression::Gzip);
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"gzipped");
+
+        let info = store.head_upstream("cafebabe").await.unwrap().unwrap();
+        assert_eq!(info.compression, Compression::Gzip);
+        assert_eq!(info.stored_size, 7);
     }
 
     #[tokio::test]
