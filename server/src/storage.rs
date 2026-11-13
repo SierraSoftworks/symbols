@@ -4,8 +4,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
 use object_store::{
-    Attribute, Attributes, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutOptions,
-    PutPayload, path::Path,
+    path::Path, Attribute, Attributes, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
+    PutOptions, PutPayload,
 };
 use serde::{Deserialize, Serialize};
 
@@ -230,19 +230,13 @@ impl StreamingWriter {
     /// Completes the object; nothing is visible at the path until this
     /// succeeds.
     pub async fn finish(self) -> Result<u64, Error> {
-        self.inner
-            .finish()
-            .await
-            .map_err(Error::Storage)?;
+        self.inner.finish().await.map_err(Error::Storage)?;
         Ok(self.written)
     }
 
     /// Abandons the write, cleaning up any parts already uploaded.
     pub async fn abort(self) -> Result<(), Error> {
-        self.inner
-            .abort()
-            .await
-            .map_err(Error::Storage)?;
+        self.inner.abort().await.map_err(Error::Storage)?;
         Ok(())
     }
 }
@@ -320,7 +314,10 @@ impl Store {
         }
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<Option<T>, Error> {
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &Path,
+    ) -> Result<Option<T>, Error> {
         match self.inner.get(path).await {
             Ok(result) => {
                 let data = result.bytes().await?;
@@ -389,7 +386,8 @@ impl Store {
                 PutPayload::from(data),
             )
             .await?;
-        self.put_json(&symbol_meta_path(project, &info.id), meta).await?;
+        self.put_json(&symbol_meta_path(project, &info.id), meta)
+            .await?;
         self.put_json(
             &index_path(&info.id),
             &IndexEntry {
@@ -416,7 +414,11 @@ impl Store {
     ) -> Result<Option<StoredObject>, Error> {
         for compression in [Compression::Gzip, Compression::None] {
             let options = GetOptions::new().with_range(range.clone().map(GetRange::Bounded));
-            match self.inner.get_opts(&encoded_path(base, compression), options).await {
+            match self
+                .inner
+                .get_opts(&encoded_path(base, compression), options)
+                .await
+            {
                 Ok(result) => {
                     let info = object_info(&result.meta, &result.attributes, compression);
                     return Ok(Some(StoredObject {
@@ -437,9 +439,17 @@ impl Store {
     async fn head_encoded(&self, base: &str) -> Result<Option<ObjectInfo>, Error> {
         for compression in [Compression::Gzip, Compression::None] {
             let options = GetOptions::new().with_head(true);
-            match self.inner.get_opts(&encoded_path(base, compression), options).await {
+            match self
+                .inner
+                .get_opts(&encoded_path(base, compression), options)
+                .await
+            {
                 Ok(result) => {
-                    return Ok(Some(object_info(&result.meta, &result.attributes, compression)));
+                    return Ok(Some(object_info(
+                        &result.meta,
+                        &result.attributes,
+                        compression,
+                    )));
                 }
                 Err(object_store::Error::NotFound { .. }) => continue,
                 Err(e) => return Err(e.into()),
@@ -456,7 +466,8 @@ impl Store {
         id: &str,
         range: Option<Range<u64>>,
     ) -> Result<Option<StoredObject>, Error> {
-        self.get_encoded(&symbol_data_base(project, id), range).await
+        self.get_encoded(&symbol_data_base(project, id), range)
+            .await
     }
 
     /// The stored symbol's metadata, without reading it.
@@ -464,7 +475,11 @@ impl Store {
         self.head_encoded(&symbol_data_base(project, id)).await
     }
 
-    pub async fn get_symbol_meta(&self, project: &str, id: &str) -> Result<Option<SymbolMeta>, Error> {
+    pub async fn get_symbol_meta(
+        &self,
+        project: &str,
+        id: &str,
+    ) -> Result<Option<SymbolMeta>, Error> {
         self.get_json(&symbol_meta_path(project, id)).await
     }
 
@@ -552,7 +567,8 @@ impl Store {
     // --- Chunked upload staging -------------------------------------------
 
     pub async fn create_upload(&self, session: &UploadSession) -> Result<(), Error> {
-        self.put_json(&upload_session_path(&session.id), session).await
+        self.put_json(&upload_session_path(&session.id), session)
+            .await
     }
 
     pub async fn get_upload(&self, id: &str) -> Result<Option<UploadSession>, Error> {
@@ -573,7 +589,11 @@ impl Store {
     }
 
     /// Opens a bounded-memory streaming writer for one staged chunk.
-    pub async fn upload_chunk_writer(&self, id: &str, index: u32) -> Result<StreamingWriter, Error> {
+    pub async fn upload_chunk_writer(
+        &self,
+        id: &str,
+        index: u32,
+    ) -> Result<StreamingWriter, Error> {
         StreamingWriter::open(&self.inner, upload_chunk_path(id, index)).await
     }
 
@@ -593,7 +613,8 @@ impl Store {
         info: &SymbolInfo,
         meta: &SymbolMeta,
     ) -> Result<(), Error> {
-        self.put_json(&symbol_meta_path(project, &info.id), meta).await?;
+        self.put_json(&symbol_meta_path(project, &info.id), meta)
+            .await?;
         self.put_json(
             &index_path(&info.id),
             &IndexEntry {
@@ -605,7 +626,11 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub async fn get_upload_chunk(&self, id: &str, index: u32) -> Result<Option<bytes::Bytes>, Error> {
+    pub async fn get_upload_chunk(
+        &self,
+        id: &str,
+        index: u32,
+    ) -> Result<Option<bytes::Bytes>, Error> {
         match self.inner.get(&upload_chunk_path(id, index)).await {
             Ok(result) => Ok(Some(result.bytes().await?)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -806,22 +831,44 @@ mod tests {
         let index = store.get_index("abcd1234").await.unwrap().unwrap();
         assert_eq!(index.project, project);
 
-        let stored = store.get_symbol(project, "abcd1234", None).await.unwrap().unwrap();
+        let stored = store
+            .get_symbol(project, "abcd1234", None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.info.stored_size, 4);
         assert_eq!(stored.info.compression, Compression::Gzip);
         assert_eq!(stored.range, 0..4);
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"data");
 
         // Metadata alone, and a slice of the stored bytes.
-        let info = store.head_symbol(project, "abcd1234").await.unwrap().unwrap();
+        let info = store
+            .head_symbol(project, "abcd1234")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(info.stored_size, 4);
         assert_eq!(info.compression, Compression::Gzip);
-        assert!(info.e_tag.is_some(), "the store should hand back its validator");
-        let meta = store.get_symbol_meta(project, "abcd1234").await.unwrap().unwrap();
+        assert!(
+            info.e_tag.is_some(),
+            "the store should hand back its validator"
+        );
+        let meta = store
+            .get_symbol_meta(project, "abcd1234")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(meta.version, "v1.0.0");
-        let part = store.get_symbol(project, "abcd1234", Some(1..3)).await.unwrap().unwrap();
+        let part = store
+            .get_symbol(project, "abcd1234", Some(1..3))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(part.range, 1..3);
-        assert_eq!(part.info.stored_size, 4, "the info describes the whole object");
+        assert_eq!(
+            part.info.stored_size, 4,
+            "the info describes the whole object"
+        );
         assert_eq!(&part.result.bytes().await.unwrap()[..], b"at");
 
         let symbols = store.list_symbols(project).await.unwrap();
@@ -830,9 +877,21 @@ mod tests {
 
         store.delete_symbol(project, "abcd1234").await.unwrap();
         assert!(store.get_index("abcd1234").await.unwrap().is_none());
-        assert!(store.get_symbol(project, "abcd1234", None).await.unwrap().is_none());
-        assert!(store.head_symbol(project, "abcd1234").await.unwrap().is_none());
-        assert!(store.get_symbol_meta(project, "abcd1234").await.unwrap().is_none());
+        assert!(store
+            .get_symbol(project, "abcd1234", None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .head_symbol(project, "abcd1234")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_symbol_meta(project, "abcd1234")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Symbols written before the server compressed at rest sit at the
@@ -847,16 +906,29 @@ mod tests {
         legacy.compression = Compression::None;
         legacy.stored_size = None;
         store
-            .put_symbol(project, &info("deadbeef"), &legacy, bytes::Bytes::from_static(b"data"))
+            .put_symbol(
+                project,
+                &info("deadbeef"),
+                &legacy,
+                bytes::Bytes::from_static(b"data"),
+            )
             .await
             .unwrap();
 
-        let stored = store.get_symbol(project, "deadbeef", None).await.unwrap().unwrap();
+        let stored = store
+            .get_symbol(project, "deadbeef", None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.info.compression, Compression::None);
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"data");
 
         store.delete_symbol(project, "deadbeef").await.unwrap();
-        assert!(store.get_symbol(project, "deadbeef", None).await.unwrap().is_none());
+        assert!(store
+            .get_symbol(project, "deadbeef", None)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -893,15 +965,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.get_upload_chunk(&session.id, 0).await.unwrap().unwrap(),
+            store
+                .get_upload_chunk(&session.id, 0)
+                .await
+                .unwrap()
+                .unwrap(),
             &b"first-"[..]
         );
-        assert!(store.get_upload_chunk(&session.id, 2).await.unwrap().is_none());
+        assert!(store
+            .get_upload_chunk(&session.id, 2)
+            .await
+            .unwrap()
+            .is_none());
 
         // delete_upload clears the session and every staged chunk.
         store.delete_upload(&session.id).await.unwrap();
         assert!(store.get_upload(&session.id).await.unwrap().is_none());
-        assert!(store.get_upload_chunk(&session.id, 0).await.unwrap().is_none());
+        assert!(store
+            .get_upload_chunk(&session.id, 0)
+            .await
+            .unwrap()
+            .is_none());
 
         // prune_staging drops whole sessions older than the cutoff — the
         // session document and every chunk staged under it.
@@ -916,7 +1000,11 @@ mod tests {
             .unwrap();
         assert_eq!(dropped, 1, "one session, chunks and all");
         assert!(store.get_upload(&session.id).await.unwrap().is_none());
-        assert!(store.get_upload_chunk(&session.id, 0).await.unwrap().is_none());
+        assert!(store
+            .get_upload_chunk(&session.id, 0)
+            .await
+            .unwrap()
+            .is_none());
 
         // A young session is untouched even when the sweep runs.
         store.create_upload(&session).await.unwrap();
@@ -930,7 +1018,11 @@ mod tests {
             .unwrap();
         assert_eq!(dropped, 0);
         assert!(store.get_upload(&session.id).await.unwrap().is_some());
-        assert!(store.get_upload_chunk(&session.id, 0).await.unwrap().is_some());
+        assert!(store
+            .get_upload_chunk(&session.id, 0)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -943,21 +1035,33 @@ mod tests {
 
         let stored = store.get_upstream("cafebabe", None).await.unwrap().unwrap();
         assert_eq!(stored.info.compression, Compression::Gzip);
-        assert_eq!(stored.info.size, Some(1234), "the inflated size rides on the object");
+        assert_eq!(
+            stored.info.size,
+            Some(1234),
+            "the inflated size rides on the object"
+        );
         assert_eq!(&stored.result.bytes().await.unwrap()[..], b"gzipped");
 
         let info = store.head_upstream("cafebabe").await.unwrap().unwrap();
         assert_eq!(info.compression, Compression::Gzip);
         assert_eq!(info.size, Some(1234));
         assert_eq!(info.stored_size, 7);
-        let part = store.get_upstream("cafebabe", Some(0..2)).await.unwrap().unwrap();
+        let part = store
+            .get_upstream("cafebabe", Some(0..2))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&part.result.bytes().await.unwrap()[..], b"gz");
     }
 
     #[tokio::test]
     async fn project_roundtrip_and_listing() {
         let store = Store::in_memory();
-        for name in ["SierraSoftworks/grey", "SierraSoftworks/bender", "OtherOrg/thing"] {
+        for name in [
+            "SierraSoftworks/grey",
+            "SierraSoftworks/bender",
+            "OtherOrg/thing",
+        ] {
             store
                 .put_project(&Project {
                     name: name.to_string(),
@@ -970,14 +1074,26 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(store.get_project("SierraSoftworks/grey").await.unwrap().is_some());
-        assert!(store.get_project("SierraSoftworks/unknown").await.unwrap().is_none());
+        assert!(store
+            .get_project("SierraSoftworks/grey")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_project("SierraSoftworks/unknown")
+            .await
+            .unwrap()
+            .is_none());
 
         let projects = store.list_projects().await.unwrap();
         let names: Vec<_> = projects.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["OtherOrg/thing", "SierraSoftworks/bender", "SierraSoftworks/grey"]
+            vec![
+                "OtherOrg/thing",
+                "SierraSoftworks/bender",
+                "SierraSoftworks/grey"
+            ]
         );
     }
 }

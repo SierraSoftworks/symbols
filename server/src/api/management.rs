@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use actix_web::{HttpRequest, HttpResponse, web};
+use actix_web::{web, HttpRequest, HttpResponse};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use crate::auth::{Claims, Identity, SESSION_COOKIE, bearer_token};
+use crate::auth::{bearer_token, Claims, Identity, SESSION_COOKIE};
 use crate::errors::Error;
-use crate::formats::{SymbolFormat, sanitize_id};
+use crate::formats::{sanitize_id, SymbolFormat};
 use crate::storage::{SymbolMeta, UpstreamStats, Visibility};
 
 /// Authenticates a management-plane request either way it can arrive: a
@@ -73,7 +73,11 @@ pub async fn get_project(
 ) -> Result<HttpResponse, Error> {
     authorize(&req, &state).await?;
     let name = project_name(&path);
-    let project = state.store.get_project(&name).await?.ok_or(Error::NotFound)?;
+    let project = state
+        .store
+        .get_project(&name)
+        .await?
+        .ok_or(Error::NotFound)?;
     Ok(HttpResponse::Ok().json(project))
 }
 
@@ -93,7 +97,11 @@ pub async fn update_project(
 ) -> Result<HttpResponse, Error> {
     let identity = authorize(&req, &state).await?;
     let name = project_name(&path);
-    let mut project = state.store.get_project(&name).await?.ok_or(Error::NotFound)?;
+    let mut project = state
+        .store
+        .get_project(&name)
+        .await?
+        .ok_or(Error::NotFound)?;
 
     if let Some(visibility) = update.visibility {
         project.visibility = visibility;
@@ -120,7 +128,11 @@ pub async fn list_symbols(
 ) -> Result<HttpResponse, Error> {
     authorize(&req, &state).await?;
     let name = project_name(&path);
-    state.store.get_project(&name).await?.ok_or(Error::NotFound)?;
+    state
+        .store
+        .get_project(&name)
+        .await?
+        .ok_or(Error::NotFound)?;
     let symbols = state.store.list_symbols(&name).await?;
     Ok(HttpResponse::Ok().json(symbols))
 }
@@ -133,7 +145,11 @@ pub async fn delete_symbol(
     let identity = authorize(&req, &state).await?;
     let name = format!("{}/{}", path.0, path.1);
     let id = sanitize_id(&path.2)?;
-    state.store.get_project(&name).await?.ok_or(Error::NotFound)?;
+    state
+        .store
+        .get_project(&name)
+        .await?
+        .ok_or(Error::NotFound)?;
     state.store.delete_symbol(&name, &id).await?;
     tracing::info!(project = %name, build_id = %id, by = %identity.subject(), "Deleted symbols");
     Ok(HttpResponse::NoContent().finish())
@@ -176,7 +192,11 @@ pub async fn purge_symbols(
     project: &str,
     filter: &PurgeFilter,
 ) -> Result<usize, Error> {
-    state.store.get_project(project).await?.ok_or(Error::NotFound)?;
+    state
+        .store
+        .get_project(project)
+        .await?
+        .ok_or(Error::NotFound)?;
 
     let symbols = state.store.list_symbols(project).await?;
     let mut deleted = 0;
@@ -277,7 +297,10 @@ pub async fn collect_stats(state: &AppState) -> Result<ServerStats, Error> {
         let versions: std::collections::HashSet<&str> =
             symbols.iter().map(|s| s.version.as_str()).collect();
         let size: u64 = symbols.iter().map(|s| s.size).sum();
-        let stored: u64 = symbols.iter().map(|s| s.stored_size.unwrap_or(s.size)).sum();
+        let stored: u64 = symbols
+            .iter()
+            .map(|s| s.stored_size.unwrap_or(s.size))
+            .sum();
         let newest = symbols.iter().map(|s| s.uploaded_at).max();
 
         symbol_count += symbols.len();

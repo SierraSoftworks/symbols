@@ -8,7 +8,7 @@ use actix_web::http::header::{
     IfNoneMatch, IfRange, LastModified, Range as RangeHeader,
 };
 use actix_web::http::{Method, StatusCode};
-use actix_web::{HttpRequest, HttpResponse, HttpResponseBuilder, web};
+use actix_web::{web, HttpRequest, HttpResponse, HttpResponseBuilder};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
@@ -131,9 +131,13 @@ async fn serve(
     // — is decided on the object's metadata alone, so no body is fetched only
     // to be dropped. A plain GET goes straight for the object.
     let metadata_first = head_only
-        || [header::RANGE, header::IF_NONE_MATCH, header::IF_MODIFIED_SINCE]
-            .iter()
-            .any(|name| req.headers().contains_key(name));
+        || [
+            header::RANGE,
+            header::IF_NONE_MATCH,
+            header::IF_MODIFIED_SINCE,
+        ]
+        .iter()
+        .any(|name| req.headers().contains_key(name));
 
     let (info, object) = if metadata_first {
         match source.head(store).await? {
@@ -179,7 +183,10 @@ async fn serve(
     });
     response.content_type("application/octet-stream");
     validators.apply(&mut response);
-    response.insert_header((header::ACCEPT_RANGES, if verbatim { "bytes" } else { "none" }));
+    response.insert_header((
+        header::ACCEPT_RANGES,
+        if verbatim { "bytes" } else { "none" },
+    ));
     if let Some(size) = size {
         // The debuginfod protocol's own size header: always the symbol
         // file's size, whatever encoding it travels in.
@@ -203,7 +210,11 @@ async fn serve(
 
     if head_only {
         // The length the GET would carry, and no body.
-        let length = if verbatim { Some(info.stored_size) } else { size };
+        let length = if verbatim {
+            Some(info.stored_size)
+        } else {
+            size
+        };
         return Ok(Some(match length {
             Some(length) => sized(&mut response, length, empty_body()),
             None => response.body(body::None::new()),
@@ -408,7 +419,13 @@ async fn federated_lookup(
     state: &AppState,
     id: &str,
 ) -> Result<HttpResponse, Error> {
-    let Some(upstream) = state.config.federation.upstream.as_deref().filter(|u| !u.is_empty()) else {
+    let Some(upstream) = state
+        .config
+        .federation
+        .upstream
+        .as_deref()
+        .filter(|u| !u.is_empty())
+    else {
         return Err(Error::NotFound);
     };
     let head_only = req.method() == Method::HEAD;
@@ -453,9 +470,10 @@ async fn federated_lookup(
                 // wanted: the upstream stream is dropped here.
                 return Ok(response.body(body::None::new()));
             }
-            let prefix = futures::stream::once(async move {
-                Ok::<Bytes, std::io::Error>(Bytes::from(buffer))
-            });
+            let prefix =
+                futures::stream::once(
+                    async move { Ok::<Bytes, std::io::Error>(Bytes::from(buffer)) },
+                );
             let first = futures::stream::once(async move { Ok(chunk) });
             let rest = body.map_err(|e| std::io::Error::other(format!("upstream stream: {e}")));
             let combined = prefix.chain(first.chain(rest));
@@ -513,10 +531,10 @@ mod tests {
     use std::sync::Arc;
 
     use actix_web::http::Method;
-    use actix_web::{App, test, web};
+    use actix_web::{test, web, App};
 
-    use crate::api::{AppState, Plane, configure_internal, configure_public};
-    use crate::compression::{Compression, compress, decompress};
+    use crate::api::{configure_internal, configure_public, AppState, Plane};
+    use crate::compression::{compress, decompress, Compression};
     use crate::config::Config;
     use crate::formats::{SymbolFormat, SymbolInfo};
     use crate::storage::{Project, Store, SymbolMeta, Visibility};
@@ -590,7 +608,10 @@ mod tests {
                 commit: None,
                 build_url: None,
             };
-            store.put_symbol(project, &info, &meta, stored).await.unwrap();
+            store
+                .put_symbol(project, &info, &meta, stored)
+                .await
+                .unwrap();
         }
 
         Arc::new(AppState::new(config, store, reqwest::Client::new()))
@@ -701,8 +722,13 @@ mod tests {
     #[actix_web::test]
     async fn compressed_symbols_pass_through_to_clients_that_accept_gzip() {
         let state = seeded_state().await;
-        let (status, body, encoding, vary) =
-            request(&state, Plane::Public, "/buildid/aabbccdd/debuginfo", Some("gzip")).await;
+        let (status, body, encoding, vary) = request(
+            &state,
+            Plane::Public,
+            "/buildid/aabbccdd/debuginfo",
+            Some("gzip"),
+        )
+        .await;
 
         assert_eq!(status, 200);
         assert_eq!(encoding.as_deref(), Some("gzip"));
@@ -717,7 +743,12 @@ mod tests {
     #[actix_web::test]
     async fn compressed_symbols_are_inflated_for_clients_that_do_not() {
         let state = seeded_state().await;
-        for accept in [None, Some("br"), Some("gzip;q=0"), Some("deflate, gzip;q=0.0")] {
+        for accept in [
+            None,
+            Some("br"),
+            Some("gzip;q=0"),
+            Some("deflate, gzip;q=0.0"),
+        ] {
             let (status, body, encoding, _) =
                 request(&state, Plane::Public, "/buildid/aabbccdd/debuginfo", accept).await;
             assert_eq!(status, 200, "accept-encoding: {accept:?}");
@@ -753,7 +784,13 @@ mod tests {
         let state = seeded_state().await;
         // The management API, the UI, and the sign-in flow are internal-plane
         // only; the public listener must not even route them.
-        for path in ["/api/v1/projects", "/", "/setup", "/auth/login", "/static/styles.css"] {
+        for path in [
+            "/api/v1/projects",
+            "/",
+            "/setup",
+            "/auth/login",
+            "/static/styles.css",
+        ] {
             let (status, _) = get(&state, Plane::Public, path).await;
             assert_eq!(status, 404, "{path} should not be routed publicly");
         }
@@ -771,7 +808,9 @@ mod tests {
         .await;
         let response = test::call_service(
             &app,
-            test::TestRequest::get().uri("/projects/SierraSoftworks/grey").to_request(),
+            test::TestRequest::get()
+                .uri("/projects/SierraSoftworks/grey")
+                .to_request(),
         )
         .await;
         assert_eq!(response.status().as_u16(), 302);
@@ -819,7 +858,12 @@ mod tests {
         )
         .await;
 
-        for uri in ["/", "/projects/SierraSoftworks/grey", "/api/v1/projects", "/api/v1/stats"] {
+        for uri in [
+            "/",
+            "/projects/SierraSoftworks/grey",
+            "/api/v1/projects",
+            "/api/v1/stats",
+        ] {
             let response = test::call_service(
                 &app,
                 test::TestRequest::get()
@@ -831,7 +875,11 @@ mod tests {
                     .to_request(),
             )
             .await;
-            assert_eq!(response.status().as_u16(), 200, "{uri} should be accessible");
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "{uri} should be accessible"
+            );
         }
 
         // And the rendered dashboard should carry the signed-in user.
@@ -868,9 +916,8 @@ mod tests {
                 .configure(configure_internal),
         )
         .await;
-        let with_session = || {
-            actix_web::cookie::Cookie::new(crate::auth::SESSION_COOKIE, session.clone())
-        };
+        let with_session =
+            || actix_web::cookie::Cookie::new(crate::auth::SESSION_COOKIE, session.clone());
 
         let response = test::call_service(
             &app,
@@ -933,8 +980,18 @@ mod tests {
     async fn head_carries_the_headers_a_get_would_and_no_body() {
         let state = seeded_state().await;
         for gzip in [false, true] {
-            let get = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", gzip)).await;
-            let head = send(&state, Plane::Public, debuginfo(Method::HEAD, "aabbccdd", gzip)).await;
+            let get = send(
+                &state,
+                Plane::Public,
+                debuginfo(Method::GET, "aabbccdd", gzip),
+            )
+            .await;
+            let head = send(
+                &state,
+                Plane::Public,
+                debuginfo(Method::HEAD, "aabbccdd", gzip),
+            )
+            .await;
             assert_eq!(head.status, 200, "gzip: {gzip}");
             assert!(head.body.is_empty(), "gzip: {gzip}");
             for name in [
@@ -951,24 +1008,41 @@ mod tests {
                 assert_eq!(head.header(name), get.header(name), "{name} (gzip: {gzip})");
             }
             assert_eq!(
-                get.header("content-length").unwrap().parse::<usize>().unwrap(),
+                get.header("content-length")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap(),
                 get.body.len(),
                 "gzip: {gzip}"
             );
         }
 
         // Absent, hidden and unsupported look the same to HEAD as to GET.
-        let hidden = send(&state, Plane::Public, debuginfo(Method::HEAD, "11223344", false)).await;
+        let hidden = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::HEAD, "11223344", false),
+        )
+        .await;
         assert_eq!(hidden.status, 404);
-        let missing = send(&state, Plane::Internal, debuginfo(Method::HEAD, "deadbeef", false)).await;
+        let missing = send(
+            &state,
+            Plane::Internal,
+            debuginfo(Method::HEAD, "deadbeef", false),
+        )
+        .await;
         assert_eq!(missing.status, 404);
         let section = test::TestRequest::default()
             .method(Method::HEAD)
             .uri("/buildid/aabbccdd/executable");
         assert_eq!(send(&state, Plane::Internal, section).await.status, 404);
-        let health = test::TestRequest::default().method(Method::HEAD).uri("/health");
+        let health = test::TestRequest::default()
+            .method(Method::HEAD)
+            .uri("/health");
         assert_eq!(send(&state, Plane::Public, health).await.status, 200);
-        let asset = test::TestRequest::default().method(Method::HEAD).uri("/static/styles.css");
+        let asset = test::TestRequest::default()
+            .method(Method::HEAD)
+            .uri("/static/styles.css");
         assert_eq!(send(&state, Plane::Internal, asset).await.status, 200);
     }
 
@@ -976,7 +1050,12 @@ mod tests {
     async fn responses_describe_the_symbol_file_and_its_representation() {
         let state = seeded_state().await;
 
-        let identity = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", false)).await;
+        let identity = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "aabbccdd", false),
+        )
+        .await;
         assert_eq!(identity.status, 200);
         assert_eq!(identity.body, b"public symbols");
         // Inflated on the way out, but the length is known from the metadata.
@@ -992,10 +1071,18 @@ mod tests {
             Some("public, max-age=31536000, immutable")
         );
         assert_eq!(identity.header("vary").as_deref(), Some("accept-encoding"));
-        assert!(identity.header("etag").unwrap().starts_with('"'), "a strong validator");
+        assert!(
+            identity.header("etag").unwrap().starts_with('"'),
+            "a strong validator"
+        );
         assert!(identity.header("last-modified").is_some());
 
-        let gzip = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
+        let gzip = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "aabbccdd", true),
+        )
+        .await;
         assert_eq!(gzip.status, 200);
         assert_eq!(
             gzip.header("x-debuginfod-size").as_deref(),
@@ -1003,7 +1090,10 @@ mod tests {
             "the protocol's size header is the file's, whatever the encoding"
         );
         assert_eq!(
-            gzip.header("content-length").unwrap().parse::<usize>().unwrap(),
+            gzip.header("content-length")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
             gzip.body.len()
         );
         assert_eq!(gzip.header("accept-ranges").as_deref(), Some("bytes"));
@@ -1014,7 +1104,12 @@ mod tests {
         );
 
         // A plain object is one representation for everyone.
-        let legacy = send(&state, Plane::Public, debuginfo(Method::GET, "99887766", false)).await;
+        let legacy = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "99887766", false),
+        )
+        .await;
         assert_eq!(legacy.header("content-length").as_deref(), Some("14"));
         assert_eq!(legacy.header("x-debuginfod-size").as_deref(), Some("14"));
         assert_eq!(legacy.header("accept-ranges").as_deref(), Some("bytes"));
@@ -1023,7 +1118,12 @@ mod tests {
     #[actix_web::test]
     async fn byte_ranges_apply_to_the_bytes_sent_verbatim() {
         let state = seeded_state().await;
-        let full = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
+        let full = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "aabbccdd", true),
+        )
+        .await;
         let stored = full.body.clone();
         let len = stored.len();
 
@@ -1038,16 +1138,25 @@ mod tests {
             let reply = send(&state, Plane::Public, request).await;
             assert_eq!(reply.status, 206, "{range}");
             assert_eq!(reply.body, expected, "{range}");
-            assert_eq!(reply.header("content-encoding").as_deref(), Some("gzip"), "{range}");
+            assert_eq!(
+                reply.header("content-encoding").as_deref(),
+                Some("gzip"),
+                "{range}"
+            );
             assert_eq!(
                 reply.header("content-length").as_deref(),
                 Some(expected.len().to_string().as_str()),
                 "{range}"
             );
-            assert_eq!(reply.header("accept-ranges").as_deref(), Some("bytes"), "{range}");
+            assert_eq!(
+                reply.header("accept-ranges").as_deref(),
+                Some("bytes"),
+                "{range}"
+            );
             assert_eq!(reply.header("etag"), full.header("etag"), "{range}");
         }
-        let request = debuginfo(Method::GET, "aabbccdd", true).insert_header(("range", "bytes=0-3"));
+        let request =
+            debuginfo(Method::GET, "aabbccdd", true).insert_header(("range", "bytes=0-3"));
         let reply = send(&state, Plane::Public, request).await;
         assert_eq!(
             reply.header("content-range").as_deref(),
@@ -1055,21 +1164,29 @@ mod tests {
         );
 
         // Objects stored plain are ranged for every client.
-        let request = debuginfo(Method::GET, "99887766", false).insert_header(("range", "bytes=0-5"));
+        let request =
+            debuginfo(Method::GET, "99887766", false).insert_header(("range", "bytes=0-5"));
         let reply = send(&state, Plane::Public, request).await;
         assert_eq!(reply.status, 206);
         assert_eq!(reply.body, b"legacy");
-        assert_eq!(reply.header("content-range").as_deref(), Some("bytes 0-5/14"));
+        assert_eq!(
+            reply.header("content-range").as_deref(),
+            Some("bytes 0-5/14")
+        );
         assert_eq!(reply.header("content-encoding"), None);
     }
 
     #[actix_web::test]
     async fn ranges_past_the_end_are_unsatisfiable() {
         let state = seeded_state().await;
-        let len = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true))
-            .await
-            .body
-            .len();
+        let len = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "aabbccdd", true),
+        )
+        .await
+        .body
+        .len();
 
         for range in ["bytes=9999-", "bytes=9999-10000", "bytes=-0"] {
             let request = debuginfo(Method::GET, "aabbccdd", true).insert_header(("range", range));
@@ -1087,7 +1204,12 @@ mod tests {
     #[actix_web::test]
     async fn ranges_that_cannot_be_honoured_are_ignored() {
         let state = seeded_state().await;
-        let full = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", true)).await;
+        let full = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "aabbccdd", true),
+        )
+        .await;
         let etag = full.header("etag").unwrap();
         let last_modified = full.header("last-modified").unwrap();
 
@@ -1100,10 +1222,16 @@ mod tests {
             (true, vec![("range", "items=0-1")]),
             (true, vec![("range", "bytes=garbage")]),
             // If-Range naming some other version.
-            (true, vec![("range", "bytes=0-3"), ("if-range", "\"stale\"")]),
             (
                 true,
-                vec![("range", "bytes=0-3"), ("if-range", "Sat, 01 Jan 2000 00:00:00 GMT")],
+                vec![("range", "bytes=0-3"), ("if-range", "\"stale\"")],
+            ),
+            (
+                true,
+                vec![
+                    ("range", "bytes=0-3"),
+                    ("if-range", "Sat, 01 Jan 2000 00:00:00 GMT"),
+                ],
             ),
         ];
         for (gzip, headers) in cases {
@@ -1133,17 +1261,26 @@ mod tests {
         }
 
         // A HEAD describes the whole representation, range or no range.
-        let request = debuginfo(Method::HEAD, "aabbccdd", true).insert_header(("range", "bytes=0-3"));
+        let request =
+            debuginfo(Method::HEAD, "aabbccdd", true).insert_header(("range", "bytes=0-3"));
         let reply = send(&state, Plane::Public, request).await;
         assert_eq!(reply.status, 200);
-        assert_eq!(reply.header("content-length"), full.header("content-length"));
+        assert_eq!(
+            reply.header("content-length"),
+            full.header("content-length")
+        );
     }
 
     #[actix_web::test]
     async fn conditional_requests_are_answered_with_304() {
         let state = seeded_state().await;
         for gzip in [false, true] {
-            let full = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", gzip)).await;
+            let full = send(
+                &state,
+                Plane::Public,
+                debuginfo(Method::GET, "aabbccdd", gzip),
+            )
+            .await;
             let etag = full.header("etag").unwrap();
             let last_modified = full.header("last-modified").unwrap();
 
@@ -1190,19 +1327,30 @@ mod tests {
             let since = |value: &str| ("if-modified-since", value.to_string());
             assert!(not_modified(&state, gzip, &full, vec![since(&last_modified)]).await);
             assert!(
-                !not_modified(&state, gzip, &full, vec![since("Sat, 01 Jan 2000 00:00:00 GMT")])
-                    .await
+                !not_modified(
+                    &state,
+                    gzip,
+                    &full,
+                    vec![since("Sat, 01 Jan 2000 00:00:00 GMT")]
+                )
+                .await
             );
             // If-None-Match decides when both are present.
             assert!(!not_modified(&state, gzip, &full, vec![other(), since(&last_modified)]).await);
 
             // A HEAD is conditional in the same way.
-            let request = debuginfo(Method::HEAD, "aabbccdd", gzip).insert_header(("if-none-match", etag));
+            let request =
+                debuginfo(Method::HEAD, "aabbccdd", gzip).insert_header(("if-none-match", etag));
             assert_eq!(send(&state, Plane::Public, request).await.status, 304);
         }
 
         // One representation's tag says nothing about the other.
-        let identity = send(&state, Plane::Public, debuginfo(Method::GET, "aabbccdd", false)).await;
+        let identity = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "aabbccdd", false),
+        )
+        .await;
         let request = debuginfo(Method::GET, "aabbccdd", true)
             .insert_header(("if-none-match", identity.header("etag").unwrap()));
         assert_eq!(send(&state, Plane::Public, request).await.status, 200);
@@ -1222,7 +1370,12 @@ mod tests {
             .await
             .unwrap();
 
-        let identity = send(&state, Plane::Public, debuginfo(Method::GET, "cafebabe", false)).await;
+        let identity = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "cafebabe", false),
+        )
+        .await;
         assert_eq!(identity.status, 200);
         assert_eq!(identity.body, data);
         assert_eq!(identity.header("content-length").as_deref(), Some("16"));
@@ -1233,18 +1386,29 @@ mod tests {
             Some("public, max-age=31536000, immutable")
         );
 
-        let gzip = send(&state, Plane::Public, debuginfo(Method::GET, "cafebabe", true)).await;
+        let gzip = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::GET, "cafebabe", true),
+        )
+        .await;
         assert_eq!(gzip.status, 200);
         assert_eq!(gzip.header("content-encoding").as_deref(), Some("gzip"));
         assert_eq!(&decompress(&gzip.body, 1 << 20).unwrap()[..], data);
 
-        let head = send(&state, Plane::Public, debuginfo(Method::HEAD, "cafebabe", true)).await;
+        let head = send(
+            &state,
+            Plane::Public,
+            debuginfo(Method::HEAD, "cafebabe", true),
+        )
+        .await;
         assert_eq!(head.status, 200);
         assert!(head.body.is_empty());
         assert_eq!(head.header("content-length"), gzip.header("content-length"));
         assert_eq!(head.header("etag"), gzip.header("etag"));
 
-        let request = debuginfo(Method::GET, "cafebabe", true).insert_header(("range", "bytes=0-1"));
+        let request =
+            debuginfo(Method::GET, "cafebabe", true).insert_header(("range", "bytes=0-1"));
         let part = send(&state, Plane::Public, request).await;
         assert_eq!(part.status, 206);
         assert_eq!(part.body, &gzip.body[0..2]);
@@ -1258,7 +1422,12 @@ mod tests {
         assert_eq!(send(&state, Plane::Public, request).await.status, 304);
 
         // The cache is plane-independent, like the upstream it fronts.
-        let internal = send(&state, Plane::Internal, debuginfo(Method::GET, "cafebabe", false)).await;
+        let internal = send(
+            &state,
+            Plane::Internal,
+            debuginfo(Method::GET, "cafebabe", false),
+        )
+        .await;
         assert_eq!(internal.status, 200);
     }
 }

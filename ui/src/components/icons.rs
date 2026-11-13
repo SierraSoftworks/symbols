@@ -38,7 +38,7 @@ pub fn os_icon(props: &OsIconProps) -> Html {
     html! {
         <span class="os-icon" title={props.os.label()}>
             { icon(raw) }
-            <span class="visually-hidden">{props.os.label()}</span>
+            <yewi::VisuallyHidden>{props.os.label()}</yewi::VisuallyHidden>
         </span>
     }
 }

@@ -194,7 +194,7 @@ mod tests {
         out.extend_from_slice(&24u32.to_le_bytes()); // sizeofcmds
         out.extend_from_slice(&0u32.to_le_bytes()); // flags
         out.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        // LC_UUID
+                                                    // LC_UUID
         out.extend_from_slice(&0x1bu32.to_le_bytes());
         out.extend_from_slice(&24u32.to_le_bytes());
         out.extend_from_slice(&uuid);
@@ -217,10 +217,7 @@ mod tests {
         // Corrupt the note type so it is no longer NT_GNU_BUILD_ID.
         let note_type_offset = (64 + 56 + 8) as usize;
         elf[note_type_offset] = 1;
-        assert!(matches!(
-            identify(&elf),
-            Err(Error::UnrecognisedFormat(_))
-        ));
+        assert!(matches!(identify(&elf), Err(Error::UnrecognisedFormat(_))));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use yew::prelude::*;
+use yewi::prelude::*;
 
 use crate::models::Flash;
 
@@ -13,12 +14,8 @@ pub struct FlashBannerProps {
 pub fn flash_banner(props: &FlashBannerProps) -> Html {
     match &props.flash {
         Some(flash) => {
-            let class = if flash.error {
-                "flash flash--error"
-            } else {
-                "flash flash--ok"
-            };
-            html! { <div {class} role="status">{&flash.message}</div> }
+            let tone = if flash.error { Tone::Danger } else { Tone::Ok };
+            html! { <Alert {tone}>{&flash.message}</Alert> }
         }
         None => Html::default(),
     }

@@ -1,4 +1,5 @@
 use yew::prelude::*;
+use yewi::prelude::*;
 
 use crate::components::{FlashBanner, VisibilityBadge};
 use crate::formatters::{ago, human_bytes, timestamp};
@@ -14,108 +15,96 @@ pub struct DashboardProps {
 
 #[function_component(DashboardView)]
 pub fn dashboard_view(props: &DashboardProps) -> Html {
+    let stats = &props.stats;
     html! {
-        <div class="content">
+        <Stack gap={Space::Lg}>
             <FlashBanner flash={props.flash.clone()} />
 
-            <section class="stats">
-                { stat_tile("Projects", props.stats.project_count.to_string(), None) }
-                { stat_tile("Stored symbols", props.stats.symbol_count.to_string(), None) }
-                { stat_tile(
-                    "Symbols size",
-                    human_bytes(props.stats.total_size),
-                    Some(format!("{} stored", human_bytes(props.stats.stored_size))),
-                ) }
-                { stat_tile(
-                    "Upstream cache",
-                    human_bytes(props.stats.upstream_size),
-                    Some(format!("{} cached entries", props.stats.upstream_entries)),
-                ) }
+            <Grid min="11rem" gap={Space::Md}>
+                <StatTile label="Projects" value={stats.project_count.to_string()} />
+                <StatTile label="Stored symbols" value={stats.symbol_count.to_string()} />
+                <StatTile
+                    label="Symbols size"
+                    value={human_bytes(stats.total_size)}
+                    detail={format!("{} stored", human_bytes(stats.stored_size))}
+                />
+                <StatTile
+                    label="Upstream cache"
+                    value={human_bytes(stats.upstream_size)}
+                    detail={format!("{} cached entries", stats.upstream_entries)}
+                />
                 {
-                    match props.stats.last_upload {
-                        Some(when) => stat_tile("Last upload", ago(when), Some(timestamp(when))),
-                        None => stat_tile("Last upload", "never".to_string(), None),
+                    match stats.last_upload {
+                        Some(when) => html! {
+                            <StatTile label="Last upload" value={ago(when)} detail={timestamp(when)} />
+                        },
+                        None => html! { <StatTile label="Last upload" value="never" /> },
                     }
                 }
-            </section>
+            </Grid>
 
-            <section class="card">
-                <h2 class="card__title">{"Projects"}</h2>
+            <Card title="Projects" flush={!props.projects.is_empty()}>
                 {
                     if props.projects.is_empty() {
                         html! {
-                            <p class="empty">
-                                {"No projects yet — the first symbol upload from a trusted \
-                                  repository creates its project automatically."}
-                            </p>
+                            <EmptyState title="No projects yet" icon={icons::PACKAGE_OPEN}>
+                                {"The first symbol upload from a trusted repository creates \
+                                  its project automatically."}
+                            </EmptyState>
                         }
                     } else {
                         html! {
-                            <div class="table-scroll">
-                                <table class="table">
-                                    <thead>
-                                        <tr>
-                                            <th>{"Project"}</th>
-                                            <th>{"Visibility"}</th>
-                                            <th class="table__num">{"Versions"}</th>
-                                            <th class="table__num">{"Symbols"}</th>
-                                            <th class="table__num">{"Size"}</th>
-                                            <th>{"Last upload"}</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        { for props.projects.iter().map(project_row) }
-                                    </tbody>
-                                </table>
-                            </div>
+                            <SimpleTable label="Projects">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">{"Project"}</th>
+                                        <th scope="col">{"Visibility"}</th>
+                                        <th scope="col" class="yi-table__cell--end">{"Versions"}</th>
+                                        <th scope="col" class="yi-table__cell--end">{"Symbols"}</th>
+                                        <th scope="col" class="yi-table__cell--end">{"Size"}</th>
+                                        <th scope="col">{"Last upload"}</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    { for props.projects.iter().map(project_row) }
+                                </tbody>
+                            </SimpleTable>
                         }
                     }
                 }
-            </section>
+            </Card>
 
-            <section class="card">
-                <h2 class="card__title">{"Maintenance"}</h2>
-                <p>
-                    {"The retention sweep prunes versions beyond each project's retention \
-                      window and ages out the upstream federation cache. It runs on a \
-                      schedule, but can be run immediately here."}
-                </p>
-                <form method="post" action={routes::sweep()}>
-                    <button type="submit" class="button">{"Run retention sweep now"}</button>
-                </form>
-            </section>
-        </div>
-    }
-}
-
-fn stat_tile(label: &str, value: String, detail: Option<String>) -> Html {
-    html! {
-        <div class="stat">
-            <span class="stat__label">{label}</span>
-            <span class="stat__value">{value}</span>
-            {
-                match detail {
-                    Some(detail) => html! { <span class="stat__detail">{detail}</span> },
-                    None => Html::default(),
-                }
-            }
-        </div>
+            <Card title="Maintenance">
+                <Stack gap={Space::Md} align={Align::Start}>
+                    <Text color={TextColor::Muted}>
+                        {"The retention sweep prunes versions beyond each project's retention \
+                          window and ages out the upstream federation cache. It runs on a \
+                          schedule, but can be run immediately here."}
+                    </Text>
+                    <form method="post" action={routes::sweep()}>
+                        <Button kind={ButtonKind::Submit} icon={icons::BRUSH_CLEANING}>
+                            {"Run retention sweep now"}
+                        </Button>
+                    </form>
+                </Stack>
+            </Card>
+        </Stack>
     }
 }
 
 fn project_row(project: &ProjectRow) -> Html {
     html! {
-        <tr>
-            <td><a class="table__link" href={routes::project(&project.name)}>{&project.name}</a></td>
+        <tr class="yi-table__row">
+            <th scope="row"><Link href={routes::project(&project.name)}>{&project.name}</Link></th>
             <td><VisibilityBadge visibility={project.visibility} /></td>
-            <td class="table__num">{project.version_count}</td>
-            <td class="table__num">{project.symbol_count}</td>
-            <td class="table__num">{human_bytes(project.total_size)}</td>
+            <td class="yi-table__cell--end">{project.version_count}</td>
+            <td class="yi-table__cell--end">{project.symbol_count}</td>
+            <td class="yi-table__cell--end">{human_bytes(project.total_size)}</td>
             <td>
                 {
                     match project.last_upload {
                         Some(when) => html! { <span title={timestamp(when)}>{ago(when)}</span> },
-                        None => html! { <span class="muted">{"never"}</span> },
+                        None => html! { <Text color={TextColor::Subtle}>{"never"}</Text> },
                     }
                 }
             </td>

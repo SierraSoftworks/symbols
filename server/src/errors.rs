@@ -1,4 +1,4 @@
-use actix_web::{HttpResponse, http::StatusCode};
+use actix_web::{http::StatusCode, HttpResponse};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -64,7 +64,10 @@ pub async fn recover(state: Arc<AppState>) {
     };
 
     for session in sessions {
-        if matches!(session.status, UploadStatus::Pending | UploadStatus::Processing) {
+        if matches!(
+            session.status,
+            UploadStatus::Pending | UploadStatus::Processing
+        ) {
             tracing::info!(
                 upload_id = %session.id,
                 project = %session.project,
@@ -115,7 +118,10 @@ async fn run_job(state: Arc<AppState>, mut session: UploadSession) {
 /// The streaming pipeline itself. Also called inline (awaited) by the
 /// single-shot upload endpoint, which keeps its synchronous response contract
 /// while sharing every byte of this path.
-pub async fn process(state: &AppState, session: &UploadSession) -> Result<serde_json::Value, Error> {
+pub async fn process(
+    state: &AppState,
+    session: &UploadSession,
+) -> Result<serde_json::Value, Error> {
     let chunks = session
         .chunks
         .ok_or_else(|| Error::Internal("session has no chunk count".to_string()))?;
@@ -128,13 +134,16 @@ pub async fn process(state: &AppState, session: &UploadSession) -> Result<serde_
     // in front of the stream. No symbol format we accept can be mistaken for
     // gzip, and a client that sent a .gz without saying so still meant it.
     let mut header = Vec::with_capacity(2);
-    (&mut reader).take(2).read_to_end(&mut header).await
+    (&mut reader)
+        .take(2)
+        .read_to_end(&mut header)
+        .await
         .map_err(|e| Error::Internal(format!("reading staged upload: {e}")))?;
     let gzipped = compression::looks_gzipped(&header);
     let reader = BufReader::new(Cursor::new(header).chain(reader));
 
-    let spool = tempfile::tempfile()
-        .map_err(|e| Error::Internal(format!("creating spool file: {e}")))?;
+    let spool =
+        tempfile::tempfile().map_err(|e| Error::Internal(format!("creating spool file: {e}")))?;
     let mut spool = tokio::fs::File::from_std(spool);
 
     let symbol_size = if gzipped {
@@ -147,7 +156,9 @@ pub async fn process(state: &AppState, session: &UploadSession) -> Result<serde_
     if symbol_size == 0 {
         return Err(Error::BadRequest("empty upload".to_string()));
     }
-    spool.flush().await
+    spool
+        .flush()
+        .await
         .map_err(|e| Error::Internal(format!("flushing spool file: {e}")))?;
 
     // --- Pass 2: identify from the spool, via mmap ---------------------------
@@ -200,15 +211,19 @@ pub async fn process(state: &AppState, session: &UploadSession) -> Result<serde_
         if gzipped {
             let mut source = std::pin::pin!(source);
             while let Some(chunk) = source.next().await {
-                let chunk = chunk.map_err(|e| Error::Internal(format!("reading staged upload: {e}")))?;
+                let chunk =
+                    chunk.map_err(|e| Error::Internal(format!("reading staged upload: {e}")))?;
                 writer.write(chunk).await?;
             }
         } else {
-            let mut encoder =
-                async_compression::tokio::bufread::GzipEncoder::new(BufReader::new(StreamReader::new(source)));
+            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(BufReader::new(
+                StreamReader::new(source),
+            ));
             let mut buffer = vec![0u8; 1024 * 1024];
             loop {
-                let n = encoder.read(&mut buffer).await
+                let n = encoder
+                    .read(&mut buffer)
+                    .await
                     .map_err(|e| Error::Internal(format!("compressing upload: {e}")))?;
                 if n == 0 {
                     break;
@@ -246,7 +261,10 @@ pub async fn process(state: &AppState, session: &UploadSession) -> Result<serde_
         commit: session.commit.as_deref().map(|c| c.to_ascii_lowercase()),
         build_url: session.build_url.clone(),
     };
-    state.store.put_symbol_meta(&project.name, &info, &meta).await?;
+    state
+        .store
+        .put_symbol_meta(&project.name, &info, &meta)
+        .await?;
 
     tracing::info!(
         project = %project.name,
@@ -279,14 +297,18 @@ async fn copy_limited<R: tokio::io::AsyncRead + Unpin>(
     limit: u64,
 ) -> Result<u64, Error> {
     let mut limited = reader.take(limit + 1);
-    let copied = tokio::io::copy(&mut limited, out).await.map_err(|e| match e.kind() {
-        // Decoder errors (a corrupt gzip stream) are the client's fault;
-        // anything else is ours.
-        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput | std::io::ErrorKind::UnexpectedEof => {
-            Error::BadRequest(format!("decoding the upload: {e}"))
-        }
-        _ => Error::Internal(format!("spooling the upload: {e}")),
-    })?;
+    let copied = tokio::io::copy(&mut limited, out)
+        .await
+        .map_err(|e| match e.kind() {
+            // Decoder errors (a corrupt gzip stream) are the client's fault;
+            // anything else is ours.
+            std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::UnexpectedEof => {
+                Error::BadRequest(format!("decoding the upload: {e}"))
+            }
+            _ => Error::Internal(format!("spooling the upload: {e}")),
+        })?;
     if copied > limit {
         return Err(Error::TooLarge(format!(
             "the upload decompresses to more than the {limit} byte limit"

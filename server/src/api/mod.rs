@@ -43,15 +43,17 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config, store: Store, http: reqwest::Client) -> Self {
         let sessions = match &config.management.session_secret {
-            Some(secret) => {
-                Sessions::new(secret.as_bytes(), config.management.session_duration)
-            }
+            Some(secret) => Sessions::new(secret.as_bytes(), config.management.session_duration),
             None => Sessions::ephemeral(config.management.session_duration),
         };
         let oidc = &config.management.oidc;
 
         Self {
-            github_auth: Validator::new(http.clone(), &config.github.issuer, &config.github.audience),
+            github_auth: Validator::new(
+                http.clone(),
+                &config.github.issuer,
+                &config.github.audience,
+            ),
             management_auth: Validator::new(http.clone(), &oidc.issuer, &oidc.client_id),
             oidc_endpoints: oidc::EndpointCache::new(http.clone(), &oidc.issuer),
             sessions,
@@ -148,10 +150,7 @@ pub fn configure_internal(cfg: &mut web::ServiceConfig) {
             "/projects/{org}/{repo}/settings",
             web::post().to(forms::update_settings),
         )
-        .route(
-            "/projects/{org}/{repo}/purge",
-            web::post().to(forms::purge),
-        )
+        .route("/projects/{org}/{repo}/purge", web::post().to(forms::purge))
         .route("/admin/sweep", web::post().to(forms::sweep))
         // Browser sign-in.
         .route("/auth/login", web::get().to(oidc::login))
@@ -159,7 +158,8 @@ pub fn configure_internal(cfg: &mut web::ServiceConfig) {
         .route("/auth/logout", web::get().to(oidc::logout))
         // Static assets, embedded in the binary.
         .route("/static/styles.css", read(assets::stylesheet))
-        .route("/static/app.js", read(assets::script));
+        .route("/static/app.js", read(assets::script))
+        .route("/static/fonts/{name}", read(assets::font));
 }
 
 async fn health(state: web::Data<Arc<AppState>>) -> actix_web::HttpResponse {

@@ -1,4 +1,5 @@
 use yew::prelude::*;
+use yewi::prelude::*;
 
 use crate::components::Snippet;
 use crate::models::SetupInfo;
@@ -62,47 +63,47 @@ pub fn setup_view(props: &SetupProps) -> Html {
     );
 
     html! {
-        <div class="content">
-            <div class="page-head">
-                <h1 class="page-head__title">{"Setup"}</h1>
-                <span class="page-head__meta">
-                    {"How to publish symbols to this server and consume them from your tooling."}
-                </span>
-            </div>
+        <Stack gap={Space::Lg}>
+            <PageHeader
+                title="Setup"
+                subtitle={html! { "How to publish symbols to this server and consume them from your tooling." }}
+            />
 
-            <section class="card">
-                <h2 class="card__title">{"Debuggers and elfutils"}</h2>
-                <p>
-                    {"The internal plane serves every project's symbols (plus federated \
-                      distro symbols) over the standard debuginfod protocol."}
-                </p>
-                <Snippet id="snippet-debuginfod" lang="bash" code={debuginfod} />
-                <Snippet id="snippet-gdb" lang="gdb" code={gdb} />
-            </section>
+            <Card title="Debuggers and elfutils">
+                <Stack gap={Space::Md}>
+                    <Text color={TextColor::Muted}>
+                        {"The internal plane serves every project's symbols (plus federated \
+                          distro symbols) over the standard debuginfod protocol."}
+                    </Text>
+                    <Snippet id="snippet-debuginfod" lang="bash" code={debuginfod} />
+                    <Snippet id="snippet-gdb" lang="gdb" code={gdb} />
+                </Stack>
+            </Card>
 
-            <section class="card">
-                <h2 class="card__title">{"Pyroscope / continuous profiling"}</h2>
-                <p>
-                    {"Point the profiler's symbolizer at the internal plane so native \
-                      stack frames in profiles resolve to source lines."}
-                </p>
-                <Snippet id="snippet-pyroscope" lang="yaml" code={pyroscope} />
-            </section>
+            <Card title="Pyroscope / continuous profiling">
+                <Stack gap={Space::Md}>
+                    <Text color={TextColor::Muted}>
+                        {"Point the profiler's symbolizer at the internal plane so native \
+                          stack frames in profiles resolve to source lines."}
+                    </Text>
+                    <Snippet id="snippet-pyroscope" lang="yaml" code={pyroscope} />
+                </Stack>
+            </Card>
 
-            <section class="card">
-                <h2 class="card__title">{"Publishing from GitHub Actions"}</h2>
-                <p>
-                    {"Repositories in a trusted organization publish with the co-located \
-                      action — no secrets required. The project appears here automatically \
-                      on first upload."}
-                </p>
-                <Snippet id="snippet-action" lang="yaml" code={action} />
-            </section>
+            <Card title="Publishing from GitHub Actions">
+                <Stack gap={Space::Md}>
+                    <Text color={TextColor::Muted}>
+                        {"Repositories in a trusted organization publish with the co-located \
+                          action — no secrets required. The project appears here automatically \
+                          on first upload."}
+                    </Text>
+                    <Snippet id="snippet-action" lang="yaml" code={action} />
+                </Stack>
+            </Card>
 
-            <section class="card">
-                <h2 class="card__title">{"Manual lookup"}</h2>
+            <Card title="Manual lookup">
                 <Snippet id="snippet-curl" lang="bash" code={curl} />
-            </section>
-        </div>
+            </Card>
+        </Stack>
     }
 }

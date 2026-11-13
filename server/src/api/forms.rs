@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use actix_web::{HttpRequest, HttpResponse, web};
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Deserialize;
 
-use super::{AppState, management, pages};
+use super::{management, pages, AppState};
 use crate::auth::Identity;
 use crate::errors::Error;
 use crate::formats::sanitize_id;
@@ -153,7 +153,11 @@ pub async fn purge(
             arch: form.arch.clone(),
         },
         (None, None) => {
-            return Ok(redirect_with_flash(&page, "Nothing selected to purge", true));
+            return Ok(redirect_with_flash(
+                &page,
+                "Nothing selected to purge",
+                true,
+            ));
         }
     };
 
@@ -189,7 +193,11 @@ pub async fn sweep(
             "Sweep complete: pruned {} symbol file(s), dropped {} upstream cache entr{}",
             summary.symbols_pruned,
             summary.upstream_dropped,
-            if summary.upstream_dropped == 1 { "y" } else { "ies" },
+            if summary.upstream_dropped == 1 {
+                "y"
+            } else {
+                "ies"
+            },
         ),
         false,
     ))

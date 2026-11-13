@@ -9,14 +9,20 @@
 use chrono::{Duration, Utc};
 use symbols_ui::*;
 
+const FONTS_DIR: &str = "preview-fonts";
+
 /// A minimal stand-in for the server's document shell (server/src/api/pages.rs).
 fn shell(title: &str, body: &str) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{title}</title><style>{}</style></head>\
+         <title>{title}</title><style>{}{}</style></head>\
          <body>{body}<script>{}</script></body></html>",
-        STYLESHEET, SCRIPT,
+        stylesheet(),
+        // The server's font URLs don't exist on disk; point the same faces
+        // at the copies written next to the pages.
+        fonts::css(FONTS_DIR),
+        SCRIPT,
     )
 }
 
@@ -170,6 +176,8 @@ async fn main() {
             },
         ),
     ];
+
+    fonts::write_to(FONTS_DIR).expect("write preview fonts");
 
     for (name, props) in pages {
         let title = props.body.title();
