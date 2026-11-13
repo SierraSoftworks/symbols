@@ -91,6 +91,22 @@ mod tests {
         crate::render(AppProps { user, body }).await
     }
 
+    /// The text a reader sees: markup dropped (code snippets are split into
+    /// highlight spans) and the entities used in these fixtures decoded.
+    fn visible_text(html: &str) -> String {
+        let mut text = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => text.push(c),
+                _ => {}
+            }
+        }
+        text.replace("&quot;", "\"").replace("&amp;", "&")
+    }
+
     #[tokio::test]
     async fn dashboard_renders_projects_and_session() {
         let html = render(
@@ -152,7 +168,10 @@ mod tests {
                             size: 4096,
                             uploaded_at: Utc::now(),
                             commit: Some("0123456789abcdef".to_string()),
-                            build_url: Some("https://github.com/SierraSoftworks/grey/actions/runs/1".to_string()),
+                            build_url: Some(
+                                "https://github.com/SierraSoftworks/grey/actions/runs/1"
+                                    .to_string(),
+                            ),
                             uploaded_from: Some("refs/tags/v1.2.3".to_string()),
                         }],
                     }],
@@ -186,6 +205,7 @@ mod tests {
             None,
         )
         .await;
+        let html = visible_text(&html);
 
         assert!(html.contains("DEBUGINFOD_URLS=\"https://symbols-internal.example.com\""));
         assert!(html.contains("SierraSoftworks/symbols@v1"));

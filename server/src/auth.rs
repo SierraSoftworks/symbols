@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use filt_rs::{Filter, FilterValue, Filterable};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -123,8 +123,13 @@ impl Validator {
         // GitHub signs with RS256; tsidp with RS256/ES256. Restrict to
         // asymmetric algorithms so an HS256 token can never be validated
         // against public key material.
-        if matches!(header.alg, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512) {
-            return Err(Error::Unauthenticated("symmetric algorithms are not accepted".to_string()));
+        if matches!(
+            header.alg,
+            Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+        ) {
+            return Err(Error::Unauthenticated(
+                "symmetric algorithms are not accepted".to_string(),
+            ));
         }
         validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
@@ -195,7 +200,8 @@ impl Identity {
 
     /// The friendliest name the token offers, if any.
     pub fn name(&self) -> Option<&str> {
-        self.claim("name").or_else(|| self.claim("preferred_username"))
+        self.claim("name")
+            .or_else(|| self.claim("preferred_username"))
     }
 
     /// Applies the management ACL to this request. A filter that fails to
@@ -383,8 +389,9 @@ impl Sessions {
     ) -> Result<String, Error> {
         self.mint(&LoginState {
             aud: LOGIN_AUDIENCE.to_string(),
-            exp: (chrono::Utc::now() + chrono::Duration::seconds(LOGIN_STATE_DURATION.as_secs() as i64))
-                .timestamp(),
+            exp: (chrono::Utc::now()
+                + chrono::Duration::seconds(LOGIN_STATE_DURATION.as_secs() as i64))
+            .timestamp(),
             state: state.to_string(),
             pkce_verifier: pkce_verifier.to_string(),
             nonce: nonce.to_string(),
@@ -457,23 +464,36 @@ mod tests {
         let id = identity();
         assert!(id.check_acl(&acl("true"), "GET", "/").is_ok());
         assert!(id.check_acl(&acl("false"), "GET", "/").is_err());
-        assert!(id.check_acl(&acl(r#"claims.sub == "user-1""#), "GET", "/").is_ok());
+        assert!(id
+            .check_acl(&acl(r#"claims.sub == "user-1""#), "GET", "/")
+            .is_ok());
         // Strings compare case-insensitively, as everywhere in filt-rs.
-        assert!(
-            id.check_acl(&acl(r#"claims.email == "benjamin@example.com""#), "GET", "/")
-                .is_ok()
-        );
-        assert!(
-            id.check_acl(&acl(r#"claims.email endswith "@elsewhere.com""#), "GET", "/")
-                .is_err()
-        );
+        assert!(id
+            .check_acl(
+                &acl(r#"claims.email == "benjamin@example.com""#),
+                "GET",
+                "/"
+            )
+            .is_ok());
+        assert!(id
+            .check_acl(
+                &acl(r#"claims.email endswith "@elsewhere.com""#),
+                "GET",
+                "/"
+            )
+            .is_err());
         // List-valued claims (groups being the useful one) become tuples.
-        assert!(
-            id.check_acl(&acl(r#"claims.groups contains "symbols-admins""#), "GET", "/")
-                .is_ok()
-        );
+        assert!(id
+            .check_acl(
+                &acl(r#"claims.groups contains "symbols-admins""#),
+                "GET",
+                "/"
+            )
+            .is_ok());
         // A claim the token didn't carry is null, which matches nothing.
-        assert!(id.check_acl(&acl(r#"claims.nope == "x""#), "GET", "/").is_err());
+        assert!(id
+            .check_acl(&acl(r#"claims.nope == "x""#), "GET", "/")
+            .is_err());
     }
 
     #[test]
@@ -482,11 +502,12 @@ mod tests {
         let read_only = acl(r#"method == "GET" || claims.groups contains "owners""#);
         let id = identity();
         assert!(id.check_acl(&read_only, "GET", "/api/v1/projects").is_ok());
-        assert!(id.check_acl(&read_only, "DELETE", "/api/v1/projects").is_err());
-        assert!(
-            id.check_acl(&acl(r#"path startswith "/api/""#), "GET", "/api/v1/stats")
-                .is_ok()
-        );
+        assert!(id
+            .check_acl(&read_only, "DELETE", "/api/v1/projects")
+            .is_err());
+        assert!(id
+            .check_acl(&acl(r#"path startswith "/api/""#), "GET", "/api/v1/stats")
+            .is_ok());
     }
 
     #[test]

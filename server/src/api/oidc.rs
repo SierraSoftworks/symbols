@@ -13,14 +13,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use actix_web::cookie::{Cookie, SameSite};
-use actix_web::{HttpRequest, HttpResponse, web};
-use base64::Engine;
+use actix_web::{web, HttpRequest, HttpResponse};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use super::{AppState, pages};
+use super::{pages, AppState};
 use crate::auth::{Claims, Identity, LOGIN_COOKIE, SESSION_COOKIE};
 use crate::errors::Error;
 
@@ -143,9 +143,10 @@ pub async fn login(
         .append_pair("code_challenge", &pkce_challenge)
         .append_pair("code_challenge_method", "S256");
 
-    let login_state = state
-        .sessions
-        .issue_login_state(&csrf_state, &pkce_verifier, &nonce, &next)?;
+    let login_state =
+        state
+            .sessions
+            .issue_login_state(&csrf_state, &pkce_verifier, &nonce, &next)?;
     let cookie = Cookie::build(LOGIN_COOKIE, login_state)
         .path("/auth")
         .http_only(true)
@@ -203,8 +204,7 @@ pub async fn callback(
         }
     };
 
-    let (Some(code), Some(returned_state)) = (query.code.as_deref(), query.state.as_deref())
-    else {
+    let (Some(code), Some(returned_state)) = (query.code.as_deref(), query.state.as_deref()) else {
         return Ok(pages::error_page(400, "Malformed sign-in callback.").await);
     };
     if returned_state != login_state.state {

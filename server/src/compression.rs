@@ -1,6 +1,6 @@
-use std::io::Write;
 #[cfg(test)]
 use std::io::Read;
+use std::io::Write;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -102,7 +102,10 @@ pub fn decode_stream(stream: ByteStream) -> ByteStream {
     // Symbol files gzipped by `gzip`/`zlib` are a single member, but nothing
     // stops a client concatenating several; decode them all.
     decoder.multiple_members(true);
-    Box::pin(tokio_util::io::ReaderStream::with_capacity(decoder, INFLATE_CHUNK_SIZE))
+    Box::pin(tokio_util::io::ReaderStream::with_capacity(
+        decoder,
+        INFLATE_CHUNK_SIZE,
+    ))
 }
 
 #[cfg(test)]
@@ -183,7 +186,11 @@ mod tests {
         let full: Vec<_> = decoded.iter().take(decoded.len() - 1).collect();
         assert!(!full.is_empty());
         for chunk in full {
-            assert_eq!(chunk.len(), INFLATE_CHUNK_SIZE, "every chunk but the last fills the buffer");
+            assert_eq!(
+                chunk.len(),
+                INFLATE_CHUNK_SIZE,
+                "every chunk but the last fills the buffer"
+            );
         }
     }
 }

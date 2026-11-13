@@ -12,6 +12,9 @@ description = "Server-side-rendered Yew frontend for the symbols server's manage
 [dependencies]
 chrono = "0.4"
 yew = { version = "0.23", features = ["ssr"] }
+# The design system: components, tokens and the compiled stylesheet. `fonts`
+# re-exports the self-hosted font files for the server to embed and serve.
+yewi = { version = "0.2", features = ["ssr", "code", "highlight", "fonts"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -119,7 +119,11 @@ pub struct OidcConfig {
 }
 
 fn default_oidc_scopes() -> Vec<String> {
-    vec!["openid".to_string(), "profile".to_string(), "email".to_string()]
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -239,8 +243,9 @@ impl Config {
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self, crate::errors::Error> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| crate::errors::Error::Config(format!("reading {}: {e}", path.display())))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            crate::errors::Error::Config(format!("reading {}: {e}", path.display()))
+        })?;
         serde_yaml::from_str(&raw)
             .map_err(|e| crate::errors::Error::Config(format!("parsing {}: {e}", path.display())))
     }
@@ -264,9 +269,13 @@ mod tests {
     /// quietly matches nothing.
     #[test]
     fn a_malformed_acl_is_rejected() {
-        let yaml = include_str!("../../config.example.yaml")
-            .replace("  #acl: claims.email", "  acl: claims.email &&& \"x\"\n  #acl: claims.email");
-        let err = serde_yaml::from_str::<Config>(&yaml).unwrap_err().to_string();
+        let yaml = include_str!("../../config.example.yaml").replace(
+            "  #acl: claims.email",
+            "  acl: claims.email &&& \"x\"\n  #acl: claims.email",
+        );
+        let err = serde_yaml::from_str::<Config>(&yaml)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("management.acl") && err.contains("not a valid operator"),
             "unexpected error: {err}"

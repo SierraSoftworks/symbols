@@ -3,19 +3,19 @@
 // and destructive forms submit without a confirmation prompt.
 "use strict";
 
-// Copy-to-clipboard for setup snippets: <button data-copy="<pre id>">.
+// Copy-to-clipboard for setup snippets: <button data-copy="<code block id>">.
+// yewi's own CopyButton needs a wasm runtime, which this UI does not ship.
 document.addEventListener("click", (event) => {
   const button = event.target.closest("[data-copy]");
   if (!button) return;
-  const source = document.getElementById(button.dataset.copy);
+  const source = document.querySelector(`#${CSS.escape(button.dataset.copy)} pre`);
   if (!source || !navigator.clipboard) return;
-  navigator.clipboard.writeText(source.innerText).then(() => {
-    const label = button.textContent;
-    button.classList.add("copied");
-    button.textContent = "Copied";
+  navigator.clipboard.writeText(source.textContent).then(() => {
+    const label = button.lastChild;
+    const text = label.textContent;
+    label.textContent = "Copied";
     setTimeout(() => {
-      button.classList.remove("copied");
-      button.textContent = label;
+      label.textContent = text;
     }, 1500);
   });
 });

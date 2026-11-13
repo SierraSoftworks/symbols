@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
-use actix_web::{HttpRequest, HttpResponse, http::StatusCode, web};
+use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
 use serde::Deserialize;
 use symbols_ui::{AppProps, PageBody};
 
-use super::{AppState, management};
+use super::{management, AppState};
 use crate::auth::Identity;
 use crate::errors::Error;
 use crate::storage::{SymbolMeta, Visibility};
@@ -46,11 +46,7 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-async fn render(
-    status: StatusCode,
-    identity: Option<&Identity>,
-    body: PageBody,
-) -> HttpResponse {
+async fn render(status: StatusCode, identity: Option<&Identity>, body: PageBody) -> HttpResponse {
     let title = body.title();
     let user = identity.map(|identity| symbols_ui::SessionUser {
         subject: identity.subject().to_string(),

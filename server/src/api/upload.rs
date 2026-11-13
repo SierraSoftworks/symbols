@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use actix_web::{HttpRequest, HttpResponse, http::header, web};
+use actix_web::{http::header, web, HttpRequest, HttpResponse};
 use futures::StreamExt;
 use serde::Deserialize;
 
 use super::AppState;
-use crate::auth::{GithubClaims, bearer_token};
+use crate::auth::{bearer_token, GithubClaims};
 use crate::compression::Compression;
 use crate::errors::Error;
 use crate::processor;
@@ -171,10 +171,7 @@ fn new_session(claims: &GithubClaims, query: UploadQuery) -> UploadSession {
 
 /// The shared upload authorization: a valid GitHub Actions OIDC token, from a
 /// repository in a trusted organization, running against an allowed ref.
-async fn authorize_uploader(
-    req: &HttpRequest,
-    state: &AppState,
-) -> Result<GithubClaims, Error> {
+async fn authorize_uploader(req: &HttpRequest, state: &AppState) -> Result<GithubClaims, Error> {
     let token = bearer_token(req)?;
     let claims: GithubClaims = state.github_auth.validate(&token).await?;
 
@@ -399,11 +396,7 @@ async fn load_session(
         return Err(Error::BadRequest("invalid upload id".to_string()));
     }
 
-    let session = state
-        .store
-        .get_upload(id)
-        .await?
-        .ok_or(Error::NotFound)?;
+    let session = state.store.get_upload(id).await?.ok_or(Error::NotFound)?;
 
     if session.project != claims.repository {
         // Indistinguishable from absent, so ids can't be probed across repos.
@@ -496,7 +489,7 @@ fn valid_upload_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{FromRequest, test};
+    use actix_web::{test, FromRequest};
     use bytes::Bytes;
 
     use crate::compression;
@@ -571,7 +564,10 @@ mod tests {
         assert!(valid_upload_id(&"ab".repeat(16)));
         assert!(!valid_upload_id(""));
         assert!(!valid_upload_id("abc"));
-        assert!(!valid_upload_id(&"AB".repeat(16)), "uppercase is never minted");
+        assert!(
+            !valid_upload_id(&"AB".repeat(16)),
+            "uppercase is never minted"
+        );
         assert!(!valid_upload_id(&"zz".repeat(16)));
         assert!(!valid_upload_id("../projects/x/y/deadbeefdeadbeef"));
     }
@@ -595,7 +591,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(staged, gzipped, "the bytes we stage must be the bytes we got");
+        assert_eq!(
+            staged, gzipped,
+            "the bytes we stage must be the bytes we got"
+        );
     }
 
     #[actix_web::test]
@@ -609,7 +608,12 @@ mod tests {
             Err(Error::TooLarge(_))
         ));
         // Nothing partial is left behind for a later complete to assemble.
-        assert!(state.store.get_upload_chunk(&id, 0).await.unwrap().is_none());
+        assert!(state
+            .store
+            .get_upload_chunk(&id, 0)
+            .await
+            .unwrap()
+            .is_none());
 
         // A declared length over the limit is refused before anything is read.
         let (req, mut parts) = test::TestRequest::post()
@@ -731,7 +735,11 @@ mod tests {
         let mut session = session_for(&claims, "v1.0.0");
         state
             .store
-            .put_upload_chunk(&session.id, 0, Bytes::from_static(b"not a symbol file at all"))
+            .put_upload_chunk(
+                &session.id,
+                0,
+                Bytes::from_static(b"not a symbol file at all"),
+            )
             .await
             .unwrap();
         session.chunks = Some(1);

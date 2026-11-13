@@ -52,7 +52,10 @@ pub async fn sweep(state: &AppState) -> Result<SweepSummary, Error> {
             .unwrap_or_else(|_| chrono::Duration::days(90));
     summary.upstream_dropped = state.store.prune_upstream(cutoff).await?;
     if summary.upstream_dropped > 0 {
-        tracing::info!(dropped = summary.upstream_dropped, "Pruned upstream federation cache");
+        tracing::info!(
+            dropped = summary.upstream_dropped,
+            "Pruned upstream federation cache"
+        );
     }
 
     // Any session still staged after this long belongs to an uploader that
@@ -64,7 +67,10 @@ pub async fn sweep(state: &AppState) -> Result<SweepSummary, Error> {
             .unwrap_or_else(|_| chrono::Duration::days(1));
     summary.staging_dropped = state.store.prune_staging(staging_cutoff).await?;
     if summary.staging_dropped > 0 {
-        tracing::info!(dropped = summary.staging_dropped, "Pruned abandoned upload staging");
+        tracing::info!(
+            dropped = summary.staging_dropped,
+            "Pruned abandoned upload staging"
+        );
     }
 
     Ok(summary)
@@ -77,7 +83,9 @@ pub async fn sweep(state: &AppState) -> Result<SweepSummary, Error> {
 fn select_stale(symbols: &[SymbolMeta], keep: usize) -> Vec<&SymbolMeta> {
     let mut versions: HashMap<&str, chrono::DateTime<chrono::Utc>> = HashMap::new();
     for symbol in symbols {
-        let entry = versions.entry(symbol.version.as_str()).or_insert(symbol.uploaded_at);
+        let entry = versions
+            .entry(symbol.version.as_str())
+            .or_insert(symbol.uploaded_at);
         *entry = (*entry).max(symbol.uploaded_at);
     }
 
@@ -125,7 +133,10 @@ mod tests {
             symbol("c2", "v1", 9),
         ];
 
-        let stale: Vec<&str> = select_stale(&symbols, 2).iter().map(|s| s.id.as_str()).collect();
+        let stale: Vec<&str> = select_stale(&symbols, 2)
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
         assert_eq!(stale, vec!["c1", "c2"]);
     }
 
