@@ -4625,9 +4625,9 @@ dependencies = [
 
 [[package]]
 name = "yewi"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe311a4471b9b542d8c5e55c562e5fd52123ed4512417a01a63a79baabc65ec4"
+checksum = "fc78c19ff4d39ede51c0b9fbe12ddbdfe48a47eedd8e802186f7e36347717f87"
 dependencies = [
  "grass",
  "js-sys",
@@ -4639,9 +4639,9 @@ dependencies = [
 
 [[package]]
 name = "yewi-fonts"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a765a63a634cd3c0a85bc8ce8c96273dff82f6ec809131d1801917b344ce80c"
+checksum = "c206d4679772f6f56972a6cd723be3b0cb32afe9b6c43659687e3b26305c8782"
 
 [[package]]
 name = "yoke"
