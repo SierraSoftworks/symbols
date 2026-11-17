@@ -246,8 +246,28 @@ impl Config {
         let raw = std::fs::read_to_string(path).map_err(|e| {
             crate::errors::Error::Config(format!("reading {}: {e}", path.display()))
         })?;
-        serde_yaml::from_str(&raw)
-            .map_err(|e| crate::errors::Error::Config(format!("parsing {}: {e}", path.display())))
+        let config: Self = serde_yaml::from_str(&raw).map_err(|e| {
+            crate::errors::Error::Config(format!("parsing {}: {e}", path.display()))
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Rejects settings that parse but cannot be used. An empty
+    /// `session_secret` would otherwise sign every session cookie with an
+    /// empty HMAC key, which jsonwebtoken (rightly) refuses to construct.
+    fn validate(&self) -> Result<(), crate::errors::Error> {
+        if self
+            .management
+            .session_secret
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(crate::errors::Error::Config(
+                "management.session_secret must not be empty; remove it to use a random per-boot secret".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -263,6 +283,17 @@ mod tests {
         assert_eq!(config.management.oidc.client_id, "symbols");
         // The ACL is commented out there, so the default applies.
         assert_eq!(config.management.acl.raw(), "true");
+    }
+
+    /// An empty session secret is a startup failure, not an unsigned cookie.
+    #[test]
+    fn an_empty_session_secret_is_rejected() {
+        let mut config: Config =
+            serde_yaml::from_str(include_str!("../../config.example.yaml")).unwrap();
+        config.management.session_secret = Some(String::new());
+        assert!(config.validate().is_err());
+        config.management.session_secret = Some("set".to_string());
+        assert!(config.validate().is_ok());
     }
 
     /// An ACL that doesn't parse is a startup failure, not a filter that
