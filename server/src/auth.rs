@@ -323,10 +323,16 @@ pub struct Sessions {
 const LOGIN_STATE_DURATION: Duration = Duration::from_secs(10 * 60);
 
 impl Sessions {
+    /// # Panics
+    /// If `secret` is empty. `Config::load` rejects an empty
+    /// `session_secret` and [`Sessions::ephemeral`] always supplies 32 bytes,
+    /// so this only fires on a programming error.
     pub fn new(secret: &[u8], session_duration: Duration) -> Self {
         Self {
-            encoding: jsonwebtoken::EncodingKey::from_secret(secret),
-            decoding: jsonwebtoken::DecodingKey::from_secret(secret),
+            encoding: jsonwebtoken::EncodingKey::from_secret(secret)
+                .expect("session secret must not be empty"),
+            decoding: jsonwebtoken::DecodingKey::from_secret(secret)
+                .expect("session secret must not be empty"),
             session_duration,
         }
     }
